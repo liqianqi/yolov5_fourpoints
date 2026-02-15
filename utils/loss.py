@@ -238,11 +238,12 @@ class ComputeLoss:
                 # Regression (keypoints)
                 pkpts = pkpts.sigmoid() * 2 - 0.5  # decode keypoints relative to grid cell
                 
-                # Keypoint regression loss: Smooth L1 + GIoU for shape alignment
-                # L1 损失用于关键点坐标精度，GIoU损失用于整体形状
-                loss_l1 = nn.functional.smooth_l1_loss(pkpts, tbox[i], reduction='mean', beta=0.5)
-                loss_giou = polygon_giou_loss(pkpts, tbox[i])
-                lbox += loss_l1 + 1.0 * loss_giou  # 提高GIoU权重从0.5到1.0
+                # Keypoint regression loss: 多损失组合提升精度
+                # Wing Loss对小误差敏感，L2惩罚大偏差，GIoU优化整体形状
+                loss_wing = wing_loss(pkpts, tbox[i], w=0.1, epsilon=0.01)  # 小误差敏感
+                loss_l2 = nn.functional.mse_loss(pkpts, tbox[i])  # 大偏差惩罚
+                loss_giou = polygon_giou_loss(pkpts, tbox[i])  # 整体形状对齐
+                lbox += 0.5 * loss_wing + 0.2 * loss_l2 + 0.3 * loss_giou
 
                 # Objectness
                 tobj[b, a, gj, gi] = 1.0  # positive samples get obj target = 1.0
