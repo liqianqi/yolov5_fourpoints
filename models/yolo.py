@@ -80,7 +80,7 @@ class Detect(nn.Module):
         """Initializes YOLOv5 detection layer with specified classes, anchors, channels, and inplace operations."""
         super().__init__()
         self.nc = nc  # number of classes
-        self.no = nc + 5  # number of outputs per anchor
+        self.no = nc + 9  # number of outputs per anchor: 8 keypoints + 1 obj + nc classes
         self.nl = len(anchors)  # number of detection layers
         self.na = len(anchors[0]) // 2  # number of anchors
         self.grid = [torch.empty(0) for _ in range(self.nl)]  # init grid
@@ -106,11 +106,15 @@ class Detect(nn.Module):
                     xy = (xy.sigmoid() * 2 + self.grid[i]) * self.stride[i]  # xy
                     wh = (wh.sigmoid() * 2) ** 2 * self.anchor_grid[i]  # wh
                     y = torch.cat((xy, wh, conf.sigmoid(), mask), 4)
-                else:  # Detect (boxes only)
-                    xy, wh, conf = x[i].sigmoid().split((2, 2, self.nc + 1), 4)
-                    xy = (xy * 2 + self.grid[i]) * self.stride[i]  # xy
-                    wh = (wh * 2) ** 2 * self.anchor_grid[i]  # wh
-                    y = torch.cat((xy, wh, conf), 4)
+                else:  # Detect (keypoints)
+                    kpts, conf = x[i].sigmoid().split((8, self.nc + 1), 4)
+                    # decode each keypoint relative to grid cell
+                    # Note: self.grid has -0.5 offset built-in, so we add 0.5 back to get correct gij
+                    kpts_decoded = kpts.clone()
+                    for p in range(4):
+                        kpts_decoded[..., p * 2] = (kpts[..., p * 2] * 2 - 0.5 + self.grid[i][..., 0] + 0.5) * self.stride[i]
+                        kpts_decoded[..., p * 2 + 1] = (kpts[..., p * 2 + 1] * 2 - 0.5 + self.grid[i][..., 1] + 0.5) * self.stride[i]
+                    y = torch.cat((kpts_decoded, conf), 4)
                 z.append(y.view(bs, self.na * nx * ny, self.no))
 
         return x if self.training else (torch.cat(z, 1),) if self.export else (torch.cat(z, 1), x)
@@ -392,7 +396,7 @@ def parse_model(d, ch):
     if not ch_mul:
         ch_mul = 8
     na = (len(anchors[0]) // 2) if isinstance(anchors, list) else anchors  # number of anchors
-    no = na * (nc + 5)  # number of outputs = anchors * (classes + 5)
+    no = na * (nc + 9)  # number of outputs = anchors * (classes + 8 keypoints + 1 obj)
 
     layers, save, c2 = [], [], ch[-1]  # layers, savelist, ch out
     for i, (f, n, m, args) in enumerate(d["backbone"] + d["head"]):  # from, number, module, args

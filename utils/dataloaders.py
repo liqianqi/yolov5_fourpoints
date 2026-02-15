@@ -787,8 +787,10 @@ class LoadImagesAndLabels(Dataset):
             shapes = (h0, w0), ((h / h0, w / w0), pad)  # for COCO mAP rescaling
 
             labels = self.labels[index].copy()
-            if labels.size:  # normalized xywh to pixel xyxy format
-                labels[:, 1:] = xywhn2xyxy(labels[:, 1:], ratio[0] * w, ratio[1] * h, padw=pad[0], padh=pad[1])
+            if labels.size:  # 归一化关键点坐标转换为像素坐标
+                # 4个点的x坐标在索引1,3,5,7，y坐标在索引2,4,6,8
+                labels[:, 1::2] = labels[:, 1::2] * ratio[0] * w + pad[0]  # kpt x coords
+                labels[:, 2::2] = labels[:, 2::2] * ratio[1] * h + pad[1]  # kpt y coords
 
             if self.augment:
                 img, labels = random_perspective(
@@ -803,7 +805,10 @@ class LoadImagesAndLabels(Dataset):
 
         nl = len(labels)  # number of labels
         if nl:
-            labels[:, 1:5] = xyxy2xywhn(labels[:, 1:5], w=img.shape[1], h=img.shape[0], clip=True, eps=1e-3)
+            # 归一化4个关键点坐标到0-1
+            labels[:, 1::2] = labels[:, 1::2] / img.shape[1]  # x coords
+            labels[:, 2::2] = labels[:, 2::2] / img.shape[0]  # y coords
+            labels[:, 1:9] = labels[:, 1:9].clip(0, 1)
 
         if self.augment:
             # Albumentations
@@ -817,19 +822,22 @@ class LoadImagesAndLabels(Dataset):
             if random.random() < hyp["flipud"]:
                 img = np.flipud(img)
                 if nl:
-                    labels[:, 2] = 1 - labels[:, 2]
+                    # 翻转所有关键点的y坐标（索引2,4,6,8）
+                    labels[:, 2::2] = 1 - labels[:, 2::2]
 
             # Flip left-right
             if random.random() < hyp["fliplr"]:
                 img = np.fliplr(img)
                 if nl:
-                    labels[:, 1] = 1 - labels[:, 1]
+                    # 翻转所有关键点的x坐标（索引1,3,5,7）
+                    labels[:, 1::2] = 1 - labels[:, 1::2]
 
             # Cutouts
             # labels = cutout(img, labels, p=0.5)
             # nl = len(labels)  # update after cutout
 
-        labels_out = torch.zeros((nl, 6))
+        ncol = labels.shape[1] if nl else 9
+        labels_out = torch.zeros((nl, 1 + ncol))
         if nl:
             labels_out[:, 1:] = torch.from_numpy(labels)
 
@@ -902,15 +910,20 @@ class LoadImagesAndLabels(Dataset):
             # Labels
             labels, segments = self.labels[index].copy(), self.segments[index].copy()
             if labels.size:
-                labels[:, 1:] = xywhn2xyxy(labels[:, 1:], w, h, padw, padh)  # normalized xywh to pixel xyxy format
+                # 归一化关键点坐标转换为像素坐标并加上pad
+                labels[:, 1::2] = labels[:, 1::2] * w + padw  # kpt x coords
+                labels[:, 2::2] = labels[:, 2::2] * h + padh  # kpt y coords
                 segments = [xyn2xy(x, w, h, padw, padh) for x in segments]
             labels4.append(labels)
             segments4.extend(segments)
 
         # Concat/clip labels
         labels4 = np.concatenate(labels4, 0)
-        for x in (labels4[:, 1:], *segments4):
-            np.clip(x, 0, 2 * s, out=x)  # clip when using random_perspective()
+        for x in segments4:
+            np.clip(x, 0, 2 * s, out=x)
+        # clip keypoints
+        labels4[:, 1::2] = labels4[:, 1::2].clip(0, 2 * s)  # x coords
+        labels4[:, 2::2] = labels4[:, 2::2].clip(0, 2 * s)  # y coords
         # img4, labels4 = replicate(img4, labels4)  # replicate
 
         # Augment
@@ -1146,15 +1159,18 @@ def verify_image_label(args):
             nf = 1  # label found
             with open(lb_file) as f:
                 lb = [x.split() for x in f.read().strip().splitlines() if len(x)]
-                if any(len(x) > 6 for x in lb):  # is segment
+                if any(len(x) == 9 for x in lb):  # 四点格式: cls x1 y1 x2 y2 x3 y3 x4 y4
+                    classes = np.array([x[0] for x in lb], dtype=np.float32)
+                    keypoints = np.array([x[1:9] for x in lb], dtype=np.float32)  # 4个点坐标
+                    lb = np.concatenate((classes.reshape(-1, 1), keypoints), 1)  # (n, 9)
+                elif any(len(x) > 6 for x in lb):  # is segment
                     classes = np.array([x[0] for x in lb], dtype=np.float32)
                     segments = [np.array(x[1:], dtype=np.float32).reshape(-1, 2) for x in lb]  # (cls, xy1...)
                     lb = np.concatenate((classes.reshape(-1, 1), segments2boxes(segments)), 1)  # (cls, xywh)
                 lb = np.array(lb, dtype=np.float32)
             if nl := len(lb):
-                assert lb.shape[1] == 5, f"labels require 5 columns, {lb.shape[1]} columns detected"
-                assert (lb >= 0).all(), f"negative label values {lb[lb < 0]}"
-                assert (lb[:, 1:] <= 1).all(), f"non-normalized or out of bounds coordinates {lb[:, 1:][lb[:, 1:] > 1]}"
+                assert lb.shape[1] == 9, f"labels require 9 columns (cls + 4 points), {lb.shape[1]} columns detected"
+                assert (lb[:, :1] >= 0).all(), f"negative class values {lb[lb[:, :1] < 0]}"
                 _, i = np.unique(lb, axis=0, return_index=True)
                 if len(i) < nl:  # duplicate row check
                     lb = lb[i]  # remove duplicates
@@ -1163,10 +1179,10 @@ def verify_image_label(args):
                     msg = f"{prefix}WARNING ⚠️ {im_file}: {nl - len(i)} duplicate labels removed"
             else:
                 ne = 1  # label empty
-                lb = np.zeros((0, 5), dtype=np.float32)
+                lb = np.zeros((0, 9), dtype=np.float32)
         else:
             nm = 1  # label missing
-            lb = np.zeros((0, 5), dtype=np.float32)
+            lb = np.zeros((0, 9), dtype=np.float32)
         return im_file, lb, shape, segments, nm, nf, ne, nc, msg
     except Exception as e:
         nc = 1

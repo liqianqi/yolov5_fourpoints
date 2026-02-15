@@ -137,15 +137,25 @@ def butter_lowpass_filtfilt(data, cutoff=1500, fs=50000, order=5):
 
 
 def output_to_target(output, max_det=300):
-    """Converts YOLOv5 model output to [batch_id, class_id, x, y, w, h, conf] format for plotting, limiting detections
-    to `max_det`.
+    """Converts YOLOv5 model output to target format for plotting, limiting detections to `max_det`.
+    
+    For keypoint model: output is [x1,y1,x2,y2,x3,y3,x4,y4,conf,cls]
+    Returns: [batch_id, cls, x1,y1,x2,y2,x3,y3,x4,y4, conf] for keypoint format
     """
     targets = []
     for i, o in enumerate(output):
-        box, conf, cls = o[:max_det, :6].cpu().split((4, 1, 1), 1)
-        j = torch.full((conf.shape[0], 1), i)
-        targets.append(torch.cat((j, cls, xyxy2xywh(box), conf), 1))
-    return torch.cat(targets, 0).numpy()
+        o = o[:max_det].cpu()
+        if o.shape[1] >= 10:  # 四点格式: [x1,y1,x2,y2,x3,y3,x4,y4,conf,cls]
+            kpts = o[:, :8]  # 8个关键点坐标
+            conf = o[:, 8:9]  # 置信度
+            cls = o[:, 9:10]  # 类别
+            j = torch.full((o.shape[0], 1), i)
+            targets.append(torch.cat((j, cls, kpts, conf), 1))  # [batch_id, cls, kpts(8), conf]
+        else:  # 原始矩形框格式
+            box, conf, cls = o[:, :6].split((4, 1, 1), 1)
+            j = torch.full((conf.shape[0], 1), i)
+            targets.append(torch.cat((j, cls, xyxy2xywh(box), conf), 1))
+    return torch.cat(targets, 0).numpy() if targets else np.zeros((0, 11))
 
 
 @threaded
@@ -190,26 +200,61 @@ def plot_images(images, targets, paths=None, fname="images.jpg", names=None):
             annotator.text([x + 5, y + 5], text=Path(paths[i]).name[:40], txt_color=(220, 220, 220))  # filenames
         if len(targets) > 0:
             ti = targets[targets[:, 0] == i]  # image targets
-            boxes = xywh2xyxy(ti[:, 2:6]).T
             classes = ti[:, 1].astype("int")
-            labels = ti.shape[1] == 6  # labels if no conf column
-            conf = None if labels else ti[:, 6]  # check for confidence presence (label vs pred)
-
-            if boxes.shape[1]:
-                if boxes.max() <= 1.01:  # if normalized with tolerance 0.01
-                    boxes[[0, 2]] *= w  # scale to pixels
-                    boxes[[1, 3]] *= h
-                elif scale < 1:  # absolute coords need scale if image scales
-                    boxes *= scale
-            boxes[[0, 2]] += x
-            boxes[[1, 3]] += y
-            for j, box in enumerate(boxes.T.tolist()):
-                cls = classes[j]
-                color = colors(cls)
-                cls = names[cls] if names else cls
-                if labels or conf[j] > 0.25:  # 0.25 conf thresh
-                    label = f"{cls}" if labels else f"{cls} {conf[j]:.1f}"
-                    annotator.box_label(box, label, color=color)
+            ncols = ti.shape[1]
+            
+            # Determine format: 4-point keypoints (10/11 cols) or bbox (6/7 cols)
+            if ncols >= 10:
+                # 4-point keypoint format: [img_idx, cls, x1, y1, x2, y2, x3, y3, x4, y4, (conf)]
+                labels = ncols == 10  # labels if no conf column
+                conf = None if labels else ti[:, 10]
+                kpts = ti[:, 2:10].copy()  # (n, 8)
+                
+                if kpts.shape[0] > 0:
+                    if kpts.max() <= 1.01:
+                        kpts[:, 0::2] *= w
+                        kpts[:, 1::2] *= h
+                    elif scale < 1:
+                        kpts *= scale
+                kpts[:, 0::2] += x
+                kpts[:, 1::2] += y
+                
+                for j in range(len(kpts)):
+                    cls = classes[j]
+                    color = colors(cls)
+                    cls_name = names[cls] if names else cls
+                    if labels or conf[j] > 0.25:
+                        label = f"{cls_name}" if labels else f"{cls_name} {conf[j]:.1f}"
+                        pts = kpts[j].reshape(4, 2).astype(int)
+                        im = np.array(annotator.im)
+                        for k in range(4):
+                            pt1 = tuple(pts[k])
+                            pt2 = tuple(pts[(k + 1) % 4])
+                            cv2.line(im, pt1, pt2, color, thickness=max(1, round(fs / 10)))
+                        cv2.putText(im, label, (pts[0][0], pts[0][1] - 5), cv2.FONT_HERSHEY_SIMPLEX, 
+                                    fs / 30, color, thickness=max(1, round(fs / 15)))
+                        annotator.im = Image.fromarray(im)
+            else:
+                # Original bbox format: [img_idx, cls, cx, cy, w, h, (conf)]
+                boxes = xywh2xyxy(ti[:, 2:6]).T
+                labels = ncols == 6
+                conf = None if labels else ti[:, 6]
+                
+                if boxes.shape[1]:
+                    if boxes.max() <= 1.01:
+                        boxes[[0, 2]] *= w
+                        boxes[[1, 3]] *= h
+                    elif scale < 1:
+                        boxes *= scale
+                boxes[[0, 2]] += x
+                boxes[[1, 3]] += y
+                for j, box in enumerate(boxes.T.tolist()):
+                    cls = classes[j]
+                    color = colors(cls)
+                    cls_name = names[cls] if names else cls
+                    if labels or conf[j] > 0.25:
+                        label = f"{cls_name}" if labels else f"{cls_name} {conf[j]:.1f}"
+                        annotator.box_label(box, label, color=color)
     annotator.im.save(fname)  # save
 
 

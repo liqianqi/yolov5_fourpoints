@@ -3,9 +3,91 @@
 
 import torch
 import torch.nn as nn
+import math
 
 from utils.metrics import bbox_iou
 from utils.torch_utils import de_parallel
+
+
+def wing_loss(pred, target, w=0.5, epsilon=0.1):
+    """
+    Wing Loss for keypoint regression.
+    More sensitive to small errors than L1/L2 loss.
+    
+    Args:
+        pred: predicted keypoints (N, 8) - values typically in [-0.5, 1.5] range
+        target: target keypoints (N, 8)
+        w: wing width, controls the range of nonlinear part (adjusted for small coords)
+        epsilon: curvature, smaller = more sensitive to small errors
+    
+    Returns:
+        Wing loss value
+    """
+    diff = torch.abs(pred - target)
+    c = w * (1.0 - math.log(1.0 + w / epsilon))
+    
+    # Wing loss: log for small errors, linear for large errors
+    loss = torch.where(
+        diff < w,
+        w * torch.log(1.0 + diff / epsilon),
+        diff - c
+    )
+    return loss.mean()
+
+
+def polygon_giou_loss(pred_kpts, target_kpts):
+    """
+    Polygon GIoU Loss using bounding box approximation.
+    Optimizes overall shape alignment, not just individual points.
+    
+    Args:
+        pred_kpts: predicted keypoints (N, 8) - x1,y1,x2,y2,x3,y3,x4,y4
+        target_kpts: target keypoints (N, 8)
+    
+    Returns:
+        1 - GIoU (loss to minimize)
+    """
+    # Extract x and y coordinates
+    pred_xs = pred_kpts[:, 0::2]  # (N, 4)
+    pred_ys = pred_kpts[:, 1::2]  # (N, 4)
+    target_xs = target_kpts[:, 0::2]
+    target_ys = target_kpts[:, 1::2]
+    
+    # Compute bounding boxes (xyxy format)
+    pred_x1, pred_y1 = pred_xs.min(1)[0], pred_ys.min(1)[0]
+    pred_x2, pred_y2 = pred_xs.max(1)[0], pred_ys.max(1)[0]
+    target_x1, target_y1 = target_xs.min(1)[0], target_ys.min(1)[0]
+    target_x2, target_y2 = target_xs.max(1)[0], target_ys.max(1)[0]
+    
+    # Intersection
+    inter_x1 = torch.max(pred_x1, target_x1)
+    inter_y1 = torch.max(pred_y1, target_y1)
+    inter_x2 = torch.min(pred_x2, target_x2)
+    inter_y2 = torch.min(pred_y2, target_y2)
+    
+    inter_w = (inter_x2 - inter_x1).clamp(min=0)
+    inter_h = (inter_y2 - inter_y1).clamp(min=0)
+    inter_area = inter_w * inter_h
+    
+    # Union
+    pred_area = (pred_x2 - pred_x1) * (pred_y2 - pred_y1)
+    target_area = (target_x2 - target_x1) * (target_y2 - target_y1)
+    union_area = pred_area + target_area - inter_area + 1e-7
+    
+    # IoU
+    iou = inter_area / union_area
+    
+    # Enclosing box
+    enclose_x1 = torch.min(pred_x1, target_x1)
+    enclose_y1 = torch.min(pred_y1, target_y1)
+    enclose_x2 = torch.max(pred_x2, target_x2)
+    enclose_y2 = torch.max(pred_y2, target_y2)
+    enclose_area = (enclose_x2 - enclose_x1) * (enclose_y2 - enclose_y1) + 1e-7
+    
+    # GIoU
+    giou = iou - (enclose_area - union_area) / enclose_area
+    
+    return (1 - giou).mean()
 
 
 def smooth_BCE(eps=0.1):
@@ -151,24 +233,19 @@ class ComputeLoss:
             tobj = torch.zeros(pi.shape[:4], dtype=pi.dtype, device=self.device)  # target obj
 
             if n := b.shape[0]:
-                # pxy, pwh, _, pcls = pi[b, a, gj, gi].tensor_split((2, 4, 5), dim=1)  # faster, requires torch 1.8.0
-                pxy, pwh, _, pcls = pi[b, a, gj, gi].split((2, 2, 1, self.nc), 1)  # target-subset of predictions
+                pkpts, _, pcls = pi[b, a, gj, gi].split((8, 1, self.nc), 1)  # keypoints, obj, cls
 
-                # Regression
-                pxy = pxy.sigmoid() * 2 - 0.5
-                pwh = (pwh.sigmoid() * 2) ** 2 * anchors[i]
-                pbox = torch.cat((pxy, pwh), 1)  # predicted box
-                iou = bbox_iou(pbox, tbox[i], CIoU=True).squeeze()  # iou(prediction, target)
-                lbox += (1.0 - iou).mean()  # iou loss
+                # Regression (keypoints)
+                pkpts = pkpts.sigmoid() * 2 - 0.5  # decode keypoints relative to grid cell
+                
+                # Keypoint regression loss: Smooth L1 + GIoU for shape alignment
+                # L1 损失用于关键点坐标精度，GIoU损失用于整体形状
+                loss_l1 = nn.functional.smooth_l1_loss(pkpts, tbox[i], reduction='mean', beta=0.5)
+                loss_giou = polygon_giou_loss(pkpts, tbox[i])
+                lbox += loss_l1 + 1.0 * loss_giou  # 提高GIoU权重从0.5到1.0
 
                 # Objectness
-                iou = iou.detach().clamp(0).type(tobj.dtype)
-                if self.sort_obj_iou:
-                    j = iou.argsort()
-                    b, a, gj, gi, iou = b[j], a[j], gj[j], gi[j], iou[j]
-                if self.gr < 1:
-                    iou = (1.0 - self.gr) + self.gr * iou
-                tobj[b, a, gj, gi] = iou  # iou ratio
+                tobj[b, a, gj, gi] = 1.0  # positive samples get obj target = 1.0
 
                 # Classification
                 if self.nc > 1:  # cls loss (only if multiple classes)
@@ -176,7 +253,7 @@ class ComputeLoss:
                     t[range(n), tcls[i]] = self.cp
                     lcls += self.BCEcls(pcls, t)  # BCE
 
-            obji = self.BCEobj(pi[..., 4], tobj)
+            obji = self.BCEobj(pi[..., 8], tobj)  # objectness is at index 8 now
             lobj += obji * self.balance[i]  # obj loss
             if self.autobalance:
                 self.balance[i] = self.balance[i] * 0.9999 + 0.0001 / obji.detach().item()
@@ -191,13 +268,13 @@ class ComputeLoss:
         return (lbox + lobj + lcls) * bs, torch.cat((lbox, lobj, lcls)).detach()
 
     def build_targets(self, p, targets):
-        """Prepares model targets from input targets (image,class,x,y,w,h) for loss computation, returning class, box,
-        indices, and anchors.
-        """
+        """Prepares model targets from input targets (image,class,x1,y1,x2,y2,x3,y3,x4,y4) for loss computation."""
         na, nt = self.na, targets.shape[0]  # number of anchors, targets
         tcls, tbox, indices, anch = [], [], [], []
-        gain = torch.ones(7, device=self.device)  # normalized to gridspace gain
-        ai = torch.arange(na, device=self.device).float().view(na, 1).repeat(1, nt)  # same as .repeat_interleave(nt)
+        # targets columns: (img_idx, cls, x1, y1, x2, y2, x3, y3, x4, y4) - 10列
+        ncol = targets.shape[1]  # 10 for 四点格式
+        gain = torch.ones(ncol + 1, device=self.device)  # +1 for anchor index appended later
+        ai = torch.arange(na, device=self.device).float().view(na, 1).repeat(1, nt)
         targets = torch.cat((targets.repeat(na, 1, 1), ai[..., None]), 2)  # append anchor indices
 
         g = 0.5  # bias
@@ -209,7 +286,6 @@ class ComputeLoss:
                     [0, 1],
                     [-1, 0],
                     [0, -1],  # j,k,l,m
-                    # [1, 1], [1, -1], [-1, 1], [-1, -1],  # jk,jm,lk,lm
                 ],
                 device=self.device,
             ).float()
@@ -218,38 +294,76 @@ class ComputeLoss:
 
         for i in range(self.nl):
             anchors, shape = self.anchors[i], p[i].shape
-            gain[2:6] = torch.tensor(shape)[[3, 2, 3, 2]]  # xyxy gain
+            # scale all keypoints to grid space: x,y repeated for 4 keypoints
+            gain[2:10] = torch.tensor(shape)[[3, 2, 3, 2, 3, 2, 3, 2]]
 
             # Match targets to anchors
-            t = targets * gain  # shape(3,n,7)
+            t = targets * gain  # shape(na,nt,ncol+1)
             if nt:
-                # Matches
-                r = t[..., 4:6] / anchors[:, None]  # wh ratio
+                # 用4个关键点的外接框来匹配anchor
+                kpts = t[..., 2:10]  # (na, nt, 8)
+                xs = kpts[..., 0::2]  # x coords
+                ys = kpts[..., 1::2]  # y coords
+                bbox_w = xs.max(-1)[0] - xs.min(-1)[0]  # 外接框宽度
+                bbox_h = ys.max(-1)[0] - ys.min(-1)[0]  # 外接框高度
+                bbox_wh = torch.stack([bbox_w, bbox_h], dim=-1)  # (na, nt, 2)
+                
+                # Matches - 用外接框的wh与anchor匹配
+                r = bbox_wh / anchors[:, None]  # wh ratio
                 j = torch.max(r, 1 / r).max(2)[0] < self.hyp["anchor_t"]  # compare
-                # j = wh_iou(anchors, t[:, 4:6]) > model.hyp['iou_t']  # iou(3,n)=wh_iou(anchors(3,2), gwh(n,2))
                 t = t[j]  # filter
 
+                # 用外接框中心作为grid分配依据
+                kpts_filtered = t[:, 2:10]
+                xs_f = kpts_filtered[:, 0::2]
+                ys_f = kpts_filtered[:, 1::2]
+                cx = (xs_f.min(-1)[0] + xs_f.max(-1)[0]) / 2
+                cy = (ys_f.min(-1)[0] + ys_f.max(-1)[0]) / 2
+                gxy = torch.stack([cx, cy], dim=-1)  # 外接框中心
+
                 # Offsets
-                gxy = t[:, 2:4]  # grid xy
                 gxi = gain[[2, 3]] - gxy  # inverse
-                j, k = ((gxy % 1 < g) & (gxy > 1)).T
+                jj, k = ((gxy % 1 < g) & (gxy > 1)).T
                 l, m = ((gxi % 1 < g) & (gxi > 1)).T
-                j = torch.stack((torch.ones_like(j), j, k, l, m))
-                t = t.repeat((5, 1, 1))[j]
-                offsets = (torch.zeros_like(gxy)[None] + off[:, None])[j]
+                jj = torch.stack((torch.ones_like(jj), jj, k, l, m))
+                t = t.repeat((5, 1, 1))[jj]
+                offsets = (torch.zeros_like(gxy)[None] + off[:, None])[jj]
+                
+                # 重新计算gxy
+                kpts_t = t[:, 2:10]
+                xs_t = kpts_t[:, 0::2]
+                ys_t = kpts_t[:, 1::2]
+                cx_t = (xs_t.min(-1)[0] + xs_t.max(-1)[0]) / 2
+                cy_t = (ys_t.min(-1)[0] + ys_t.max(-1)[0]) / 2
+                gxy = torch.stack([cx_t, cy_t], dim=-1)
             else:
                 t = targets[0]
                 offsets = 0
+                kpts_t = t[:, 2:10]
+                xs_t = kpts_t[:, 0::2]
+                ys_t = kpts_t[:, 1::2]
+                cx_t = (xs_t.min(-1)[0] + xs_t.max(-1)[0]) / 2
+                cy_t = (ys_t.min(-1)[0] + ys_t.max(-1)[0]) / 2
+                gxy = torch.stack([cx_t, cy_t], dim=-1)
 
             # Define
-            bc, gxy, gwh, a = t.chunk(4, 1)  # (image, class), grid xy, grid wh, anchors
-            a, (b, c) = a.long().view(-1), bc.long().T  # anchors, image, class
+            bc = t[:, :2]          # (image_idx, class)
+            a = t[:, -1].long()    # anchor index (last column)
+            b, c = bc.long().T     # image, class
             gij = (gxy - offsets).long()
             gi, gj = gij.T  # grid indices
 
             # Append
-            indices.append((b, a, gj.clamp_(0, shape[2] - 1), gi.clamp_(0, shape[3] - 1)))  # image, anchor, grid
-            tbox.append(torch.cat((gxy - gij, gwh), 1))  # box
+            indices.append((b, a, gj.clamp_(0, shape[2] - 1), gi.clamp_(0, shape[3] - 1)))
+
+            # Keypoint targets relative to grid cell
+            gkpts = t[:, 2:10]  # keypoints in grid space
+            gkpts_rel = gkpts.clone()
+            for p_idx in range(4):
+                gkpts_rel[:, p_idx * 2] -= gij[:, 0].float()      # relative to grid_x
+                gkpts_rel[:, p_idx * 2 + 1] -= gij[:, 1].float()  # relative to grid_y
+            tbox.append(gkpts_rel)
+
             anch.append(anchors[a])  # anchors
             tcls.append(c)  # class
 

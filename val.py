@@ -51,8 +51,10 @@ from utils.general import (
     colorstr,
     increment_path,
     non_max_suppression,
+    polygon_iou_batch,
     print_args,
     scale_boxes,
+    scale_keypoints,
     xywh2xyxy,
     xyxy2xywh,
 )
@@ -140,42 +142,53 @@ def save_one_json(predn, jdict, path, class_map):
 
 
 def process_batch(detections, labels, iouv):
-    """Return a correct prediction matrix given detections and labels at various IoU thresholds.
-
-    Args:
-        detections (np.ndarray): Array of shape (N, 6) where each row corresponds to a detection with format [x1, y1,
-            x2, y2, conf, class].
-        labels (np.ndarray): Array of shape (M, 5) where each row corresponds to a ground truth label with format
-            [class, x1, y1, x2, y2].
-        iouv (np.ndarray): Array of IoU thresholds to evaluate at.
-
-    Returns:
-        correct (np.ndarray): A binary array of shape (N, len(iouv)) indicating whether each detection is a true
-            positive for each IoU threshold. There are 10 IoU levels used in the evaluation.
-
-    Examples:
-        ```python
-        detections = np.array([[50, 50, 200, 200, 0.9, 1], [30, 30, 150, 150, 0.7, 0]])
-        labels = np.array([[1, 50, 50, 200, 200]])
-        iouv = np.linspace(0.5, 0.95, 10)
-        correct = process_batch(detections, labels, iouv)
-        ```
-
-    Notes:
-        - This function is used as part of the evaluation pipeline for object detection models.
-        - IoU (Intersection over Union) is a common evaluation metric for object detection performance.
-    """
+    """Return a correct prediction matrix given detections and labels at various IoU thresholds."""
     correct = np.zeros((detections.shape[0], iouv.shape[0])).astype(bool)
     iou = box_iou(labels[:, 1:], detections[:, :4])
     correct_class = labels[:, 0:1] == detections[:, 5]
     for i in range(len(iouv)):
-        x = torch.where((iou >= iouv[i]) & correct_class)  # IoU > threshold and classes match
+        x = torch.where((iou >= iouv[i]) & correct_class)
         if x[0].shape[0]:
-            matches = torch.cat((torch.stack(x, 1), iou[x[0], x[1]][:, None]), 1).cpu().numpy()  # [label, detect, iou]
+            matches = torch.cat((torch.stack(x, 1), iou[x[0], x[1]][:, None]), 1).cpu().numpy()
             if x[0].shape[0] > 1:
                 matches = matches[matches[:, 2].argsort()[::-1]]
                 matches = matches[np.unique(matches[:, 1], return_index=True)[1]]
-                # matches = matches[matches[:, 2].argsort()[::-1]]
+                matches = matches[np.unique(matches[:, 0], return_index=True)[1]]
+            correct[matches[:, 1].astype(int), i] = True
+    return torch.tensor(correct, dtype=torch.bool, device=iouv.device)
+
+
+def process_batch_polygon(detections, labels, iouv):
+    """使用外接框IoU评估检测结果（更快更稳定）。
+    detections: (N, 10) - [kpts(8), conf, cls]
+    labels: (M, 9) - [cls, kpts(8)]
+    """
+    correct = np.zeros((detections.shape[0], iouv.shape[0])).astype(bool)
+    
+    # 从关键点计算外接框
+    det_kpts = detections[:, :8]
+    det_xs = det_kpts[:, 0::2]  # (N, 4)
+    det_ys = det_kpts[:, 1::2]
+    det_boxes = torch.stack([det_xs.min(1)[0], det_ys.min(1)[0], 
+                             det_xs.max(1)[0], det_ys.max(1)[0]], dim=1)  # (N, 4) xyxy
+    
+    lbl_kpts = labels[:, 1:9]
+    lbl_xs = lbl_kpts[:, 0::2]  # (M, 4)
+    lbl_ys = lbl_kpts[:, 1::2]
+    lbl_boxes = torch.stack([lbl_xs.min(1)[0], lbl_ys.min(1)[0],
+                             lbl_xs.max(1)[0], lbl_ys.max(1)[0]], dim=1)  # (M, 4) xyxy
+    
+    # 计算外接框IoU
+    iou = box_iou(lbl_boxes, det_boxes)  # (M, N)
+    
+    correct_class = labels[:, 0:1] == detections[:, 9]
+    for i in range(len(iouv)):
+        x = torch.where((iou >= iouv[i]) & correct_class)
+        if x[0].shape[0]:
+            matches = torch.cat((torch.stack(x, 1), iou[x[0], x[1]][:, None]), 1).cpu().numpy()
+            if x[0].shape[0] > 1:
+                matches = matches[matches[:, 2].argsort()[::-1]]
+                matches = matches[np.unique(matches[:, 1], return_index=True)[1]]
                 matches = matches[np.unique(matches[:, 0], return_index=True)[1]]
             correct[matches[:, 1].astype(int), i] = True
     return torch.tensor(correct, dtype=torch.bool, device=iouv.device)
@@ -342,11 +355,15 @@ def run(
             loss += compute_loss(train_out, targets)[1]  # box, obj, cls
 
         # NMS
-        targets[:, 2:] *= torch.tensor((width, height, width, height), device=device)  # to pixels
+        # Scale targets to pixels: 4 keypoints (cols 2:10)
+        kpt_scale = torch.tensor([width, height] * 4, device=device)  # x,y repeated 4 times
+        targets[:, 2:10] *= kpt_scale
         lb = [targets[targets[:, 0] == i, 1:] for i in range(nb)] if save_hybrid else []  # for autolabelling
         with dt[2]:
+            # Use agnostic NMS: each location can only have one class (mutually exclusive)
             preds = non_max_suppression(
-                preds, conf_thres, iou_thres, labels=lb, multi_label=True, agnostic=single_cls, max_det=max_det
+                preds, conf_thres, iou_thres, labels=lb, multi_label=False, agnostic=True, max_det=max_det,
+                polygon_nms_enabled=False  # Disabled for speed during training
             )
 
         # Metrics
@@ -366,19 +383,31 @@ def run(
 
             # Predictions
             if single_cls:
-                pred[:, 5] = 0
+                pred[:, 9] = 0  # cls is at index 9
             predn = pred.clone()
-            scale_boxes(im[si].shape[1:], predn[:, :4], shape, shapes[si][1])  # native-space pred
+            # Scale keypoints to native space
+            scale_keypoints(im[si].shape[1:], predn[:, :8], shape, shapes[si][1])
 
-            # Evaluate
+            # Evaluate using polygon IoU
             if nl:
-                tbox = xywh2xyxy(labels[:, 1:5])  # target boxes
-                scale_boxes(im[si].shape[1:], tbox, shape, shapes[si][1])  # native-space labels
-                labelsn = torch.cat((labels[:, 0:1], tbox), 1)  # native-space labels
-                correct = process_batch(predn, labelsn, iouv)
+                # Scale target keypoints to native space
+                tkpts = labels[:, 1:9].clone()  # target keypoints
+                scale_keypoints(im[si].shape[1:], tkpts, shape, shapes[si][1])
+                labelsn = torch.cat((labels[:, 0:1], tkpts), 1)  # native-space labels (cls, kpts)
+                correct = process_batch_polygon(predn, labelsn, iouv)
                 if plots:
-                    confusion_matrix.process_batch(predn, labelsn)
-            stats.append((correct, pred[:, 4], pred[:, 5], labels[:, 0]))  # (correct, conf, pcls, tcls)
+                    # For confusion matrix, use bounding box approximation
+                    pred_kpts = predn[:, :8]
+                    pred_xs = pred_kpts[:, 0::2]
+                    pred_ys = pred_kpts[:, 1::2]
+                    pred_boxes = torch.stack([pred_xs.min(1)[0], pred_ys.min(1)[0], pred_xs.max(1)[0], pred_ys.max(1)[0]], 1)
+                    predn_std = torch.cat((pred_boxes, predn[:, 8:10]), 1)
+                    t_xs = tkpts[:, 0::2]
+                    t_ys = tkpts[:, 1::2]
+                    tbox = torch.stack([t_xs.min(1)[0], t_ys.min(1)[0], t_xs.max(1)[0], t_ys.max(1)[0]], 1)
+                    labelsn_box = torch.cat((labels[:, 0:1], tbox), 1)
+                    confusion_matrix.process_batch(predn_std, labelsn_box)
+            stats.append((correct, pred[:, 8], pred[:, 9], labels[:, 0]))  # (correct, conf, pcls, tcls)
 
             # Save/log
             if save_txt:

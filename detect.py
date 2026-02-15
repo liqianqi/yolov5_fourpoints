@@ -60,6 +60,7 @@ from utils.general import (
     non_max_suppression,
     print_args,
     scale_boxes,
+    scale_keypoints,
     strip_optimizer,
     xyxy2xywh,
 )
@@ -206,7 +207,10 @@ def run(
                 pred = model(im, augment=augment, visualize=visualize)
         # NMS
         with dt[2]:
-            pred = non_max_suppression(pred, conf_thres, iou_thres, classes, agnostic_nms, max_det=max_det)
+            # Use agnostic NMS: each location can only have one class
+            # 启用多边形NMS，更精确地处理关键点检测
+            pred = non_max_suppression(pred, conf_thres, iou_thres, classes, agnostic=True, max_det=max_det,
+                                       polygon_nms_enabled=True)  # 使用多边形NMS
 
         # Second-stage classifier (optional)
         # pred = utils.general.apply_classifier(pred, classifier_model, im, im0s)
@@ -238,20 +242,20 @@ def run(
             save_path = str(save_dir / p.name)  # im.jpg
             txt_path = str(save_dir / "labels" / p.stem) + ("" if dataset.mode == "image" else f"_{frame}")  # im.txt
             s += "{:g}x{:g} ".format(*im.shape[2:])  # print string
-            gn = torch.tensor(im0.shape)[[1, 0, 1, 0]]  # normalization gain whwh
+            gn = torch.tensor(im0.shape)[[1, 0, 1, 0, 1, 0, 1, 0]]  # normalization gain for 4 keypoints
             imc = im0.copy() if save_crop else im0  # for save_crop
             annotator = Annotator(im0, line_width=line_thickness, example=str(names))
             if len(det):
-                # Rescale boxes from img_size to im0 size
-                det[:, :4] = scale_boxes(im.shape[2:], det[:, :4], im0.shape).round()
+                # Rescale keypoints from img_size to im0 size
+                det[:, :8] = scale_keypoints(im.shape[2:], det[:, :8], im0.shape).round()
 
                 # Print results
-                for c in det[:, 5].unique():
-                    n = (det[:, 5] == c).sum()  # detections per class
+                for c in det[:, 9].unique():
+                    n = (det[:, 9] == c).sum()  # detections per class
                     s += f"{n} {names[int(c)]}{'s' * (n > 1)}, "  # add to string
 
                 # Write results
-                for *xyxy, conf, cls in reversed(det):
+                for *kpts, conf, cls in reversed(det):
                     c = int(cls)  # integer class
                     label = names[c] if hide_conf else f"{names[c]}"
                     confidence = float(conf)
@@ -260,22 +264,31 @@ def run(
                     if save_csv:
                         write_to_csv(p.name, label, confidence_str)
 
-                    if save_txt:  # Write to file
-                        if save_format == 0:
-                            coords = (
-                                (xyxy2xywh(torch.tensor(xyxy).view(1, 4)) / gn).view(-1).tolist()
-                            )  # normalized xywh
-                        else:
-                            coords = (torch.tensor(xyxy).view(1, 4) / gn).view(-1).tolist()  # xyxy
+                    if save_txt:  # Write to file - 保存4个关键点
+                        kpts_arr = torch.tensor(kpts[:8]).view(1, 8)
+                        gn_kpts = torch.tensor(im0.shape)[[1, 0, 1, 0, 1, 0, 1, 0]]  # normalization gain
+                        coords = (kpts_arr / gn_kpts).view(-1).tolist()  # normalized keypoints
                         line = (cls, *coords, conf) if save_conf else (cls, *coords)  # label format
                         with open(f"{txt_path}.txt", "a") as f:
                             f.write(("%g " * len(line)).rstrip() % line + "\n")
 
-                    if save_img or save_crop or view_img:  # Add bbox to image
+                    if save_img or save_crop or view_img:  # 绘制四边形
                         c = int(cls)  # integer class
                         label = None if hide_labels else (names[c] if hide_conf else f"{names[c]} {conf:.2f}")
-                        annotator.box_label(xyxy, label, color=colors(c, True))
+                        # 绘制四边形（4个点连线）
+                        pts = [(int(kpts[i]), int(kpts[i+1])) for i in range(0, 8, 2)]
+                        color = colors(c, True)
+                        for i in range(4):
+                            cv2.line(im0, pts[i], pts[(i+1) % 4], color, line_thickness)
+                        if label:
+                            # 在第一个点附近绘制标签
+                            cv2.putText(im0, label, (pts[0][0], pts[0][1] - 5), 
+                                       cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
                     if save_crop:
+                        # 用外接框裁剪
+                        xs = [kpts[i] for i in range(0, 8, 2)]
+                        ys = [kpts[i] for i in range(1, 8, 2)]
+                        xyxy = [min(xs), min(ys), max(xs), max(ys)]
                         save_one_box(xyxy, imc, file=save_dir / "crops" / names[c] / f"{p.stem}.jpg", BGR=True)
 
             # Stream results

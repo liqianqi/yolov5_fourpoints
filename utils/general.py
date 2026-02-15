@@ -962,6 +962,209 @@ def scale_boxes(img1_shape, boxes, img0_shape, ratio_pad=None):
     return boxes
 
 
+def scale_keypoints(img1_shape, keypoints, img0_shape, ratio_pad=None):
+    """Rescales 4 keypoints (x1,y1,x2,y2,x3,y3,x4,y4) from img1_shape to img0_shape."""
+    if ratio_pad is None:  # calculate from img0_shape
+        gain = min(img1_shape[0] / img0_shape[0], img1_shape[1] / img0_shape[1])  # gain  = old / new
+        pad = (img1_shape[1] - img0_shape[1] * gain) / 2, (img1_shape[0] - img0_shape[0] * gain) / 2  # wh padding
+    else:
+        gain = ratio_pad[0][0]
+        pad = ratio_pad[1]
+
+    keypoints[..., [0, 2, 4, 6]] -= pad[0]  # x coords
+    keypoints[..., [1, 3, 5, 7]] -= pad[1]  # y coords
+    keypoints[..., :8] /= gain
+    clip_keypoints(keypoints, img0_shape)
+    return keypoints
+
+
+def clip_keypoints(keypoints, shape):
+    """Clips keypoint coordinates (x1,y1,x2,y2,x3,y3,x4,y4) to fit within the specified image shape."""
+    if isinstance(keypoints, torch.Tensor):
+        keypoints[..., [0, 2, 4, 6]].clamp_(0, shape[1])  # x
+        keypoints[..., [1, 3, 5, 7]].clamp_(0, shape[0])  # y
+    else:
+        keypoints[..., [0, 2, 4, 6]] = keypoints[..., [0, 2, 4, 6]].clip(0, shape[1])
+        keypoints[..., [1, 3, 5, 7]] = keypoints[..., [1, 3, 5, 7]].clip(0, shape[0])
+
+
+def polygon_area(poly):
+    """计算多边形面积（Shoelace公式）。poly: (n, 2) 或 (4, 2)"""
+    n = len(poly)
+    area = 0.0
+    for i in range(n):
+        j = (i + 1) % n
+        area += poly[i, 0] * poly[j, 1]
+        area -= poly[j, 0] * poly[i, 1]
+    return abs(area) / 2.0
+
+
+def polygon_intersection(poly1, poly2):
+    """使用Sutherland-Hodgman算法计算两个凸多边形的交集。"""
+    def clip_polygon_by_edge(polygon, p1, p2):
+        """用边p1->p2裁剪多边形"""
+        if len(polygon) == 0:
+            return polygon
+        
+        clipped = []
+        for i in range(len(polygon)):
+            curr = polygon[i]
+            prev = polygon[i - 1]
+            
+            # 计算点相对于边的位置
+            d_curr = (p2[0] - p1[0]) * (curr[1] - p1[1]) - (p2[1] - p1[1]) * (curr[0] - p1[0])
+            d_prev = (p2[0] - p1[0]) * (prev[1] - p1[1]) - (p2[1] - p1[1]) * (prev[0] - p1[0])
+            
+            if d_curr >= 0:  # 当前点在边内侧
+                if d_prev < 0:  # 前一个点在外侧，添加交点
+                    t = d_prev / (d_prev - d_curr)
+                    intersect = [prev[0] + t * (curr[0] - prev[0]), prev[1] + t * (curr[1] - prev[1])]
+                    clipped.append(intersect)
+                clipped.append(curr.tolist() if hasattr(curr, 'tolist') else list(curr))
+            elif d_prev >= 0:  # 当前点在外侧，前一个点在内侧
+                t = d_prev / (d_prev - d_curr)
+                intersect = [prev[0] + t * (curr[0] - prev[0]), prev[1] + t * (curr[1] - prev[1])]
+                clipped.append(intersect)
+        
+        return clipped
+
+    # 确保多边形是逆时针方向
+    def ensure_ccw(poly):
+        """确保多边形顶点按逆时针顺序排列"""
+        pts = [p.tolist() if hasattr(p, 'tolist') else list(p) for p in poly]
+        # 计算有符号面积
+        area = 0
+        n = len(pts)
+        for i in range(n):
+            j = (i + 1) % n
+            area += pts[i][0] * pts[j][1]
+            area -= pts[j][0] * pts[i][1]
+        if area < 0:  # 顺时针，需要反转
+            pts = pts[::-1]
+        return pts
+    
+    result = ensure_ccw(poly1)
+    poly2_ccw = ensure_ccw(poly2)
+    
+    for i in range(len(poly2_ccw)):
+        if len(result) == 0:
+            break
+        p1 = poly2_ccw[i]
+        p2 = poly2_ccw[(i + 1) % len(poly2_ccw)]
+        result = clip_polygon_by_edge(result, p1, p2)
+    
+    return np.array(result) if len(result) > 0 else np.array([]).reshape(0, 2)
+
+
+def polygon_iou_single(poly1, poly2, return_iomin=False):
+    """计算两个四边形的IoU。poly1, poly2: (4, 2)
+    
+    Args:
+        poly1, poly2: 四边形顶点坐标 (4, 2)
+        return_iomin: 是否同时返回IoMin (用于检测包含关系)
+    
+    Returns:
+        如果 return_iomin=False: IoU
+        如果 return_iomin=True: (IoU, IoMin)
+    """
+    area1 = polygon_area(poly1)
+    area2 = polygon_area(poly2)
+    
+    if area1 < 1e-6 or area2 < 1e-6:
+        return (0.0, 0.0) if return_iomin else 0.0
+    
+    # 计算交集
+    intersection = polygon_intersection(poly1, poly2)
+    if len(intersection) < 3:
+        return (0.0, 0.0) if return_iomin else 0.0
+    
+    inter_area = polygon_area(intersection)
+    union_area = area1 + area2 - inter_area
+    
+    if union_area < 1e-6:
+        return (0.0, 0.0) if return_iomin else 0.0
+    
+    iou = inter_area / union_area
+    
+    if return_iomin:
+        # IoMin: 交集/最小框面积，用于检测包含关系
+        # 当一个框完全包含另一个时，IoMin ≈ 1.0
+        min_area = min(area1, area2)
+        iomin = inter_area / min_area if min_area > 1e-6 else 0.0
+        return iou, iomin
+    
+    return iou
+
+
+def polygon_iou_batch(kpts1, kpts2):
+    """批量计算多边形IoU。kpts1: (N, 8), kpts2: (M, 8)。返回 (N, M) IoU矩阵"""
+    n = kpts1.shape[0]
+    m = kpts2.shape[0]
+    iou_matrix = np.zeros((n, m))
+    
+    for i in range(n):
+        poly1 = kpts1[i].reshape(4, 2)
+        for j in range(m):
+            poly2 = kpts2[j].reshape(4, 2)
+            iou_matrix[i, j] = polygon_iou_single(poly1, poly2)
+    
+    return iou_matrix
+
+
+def polygon_nms(kpts, scores, iou_thres, iomin_thres=0.6):
+    """基于多边形IoU的NMS，同时检测包含关系。
+    
+    Args:
+        kpts: 关键点坐标 (N, 8)
+        scores: 置信度分数 (N,)
+        iou_thres: IoU阈值，大于此值的框会被抑制
+        iomin_thres: IoMin阈值，用于检测包含关系（一个框包含另一个）
+    
+    Returns:
+        保留的索引
+    """
+    if len(kpts) == 0:
+        return np.array([], dtype=np.int64)
+    
+    # 转为numpy
+    if isinstance(kpts, torch.Tensor):
+        kpts = kpts.cpu().numpy()
+    if isinstance(scores, torch.Tensor):
+        scores = scores.cpu().numpy()
+    
+    # 按分数排序
+    order = scores.argsort()[::-1]
+    keep = []
+    
+    while len(order) > 0:
+        i = order[0]
+        keep.append(i)
+        
+        if len(order) == 1:
+            break
+        
+        # 计算当前框与其余框的IoU和IoMin
+        remaining = order[1:]
+        suppress_mask = np.zeros(len(remaining), dtype=bool)
+        
+        for idx, j in enumerate(remaining):
+            iou, iomin = polygon_iou_single(
+                kpts[i].reshape(4, 2), 
+                kpts[j].reshape(4, 2), 
+                return_iomin=True
+            )
+            # 满足任一条件则抑制：
+            # 1. IoU > 阈值（传统NMS）
+            # 2. IoMin > 阈值（一个框包含另一个）
+            if iou > iou_thres or iomin > iomin_thres:
+                suppress_mask[idx] = True
+        
+        # 保留未被抑制的框
+        order = remaining[~suppress_mask]
+    
+    return np.array(keep, dtype=np.int64)
+
+
 def scale_segments(img1_shape, segments, img0_shape, ratio_pad=None, normalize=False):
     """Rescales segment coordinates from img1_shape to img0_shape, optionally normalizing them with custom padding."""
     if ratio_pad is None:  # calculate from img0_shape
@@ -1013,6 +1216,7 @@ def non_max_suppression(
     labels=(),
     max_det=300,
     nm=0,  # number of masks
+    polygon_nms_enabled=False,  # 是否使用多边形NMS（慢但精确），默认用外接框NMS（快）
 ):
     """Non-Maximum Suppression (NMS) on inference results to reject overlapping detections.
 
@@ -1030,8 +1234,8 @@ def non_max_suppression(
     if mps:  # MPS not fully supported yet, convert tensors to CPU before NMS
         prediction = prediction.cpu()
     bs = prediction.shape[0]  # batch size
-    nc = prediction.shape[2] - nm - 5  # number of classes
-    xc = prediction[..., 4] > conf_thres  # candidates
+    nc = prediction.shape[2] - nm - 9  # number of classes (8 keypoints + 1 obj + nc)
+    xc = prediction[..., 8] > conf_thres  # candidates (obj conf at index 8)
 
     # Settings
     # min_wh = 2  # (pixels) minimum box width and height
@@ -1043,8 +1247,8 @@ def non_max_suppression(
     merge = False  # use merge-NMS
 
     t = time.time()
-    mi = 5 + nc  # mask start index
-    output = [torch.zeros((0, 6 + nm), device=prediction.device)] * bs
+    mi = 9 + nc  # mask start index (8 keypoints + 1 obj + nc classes)
+    output = [torch.zeros((0, 10 + nm), device=prediction.device)] * bs  # kpts(8) + conf + cls + masks
     for xi, x in enumerate(prediction):  # image index, image inference
         # Apply constraints
         # x[((x[..., 2:4] < min_wh) | (x[..., 2:4] > max_wh)).any(1), 4] = 0  # width-height
@@ -1064,46 +1268,66 @@ def non_max_suppression(
             continue
 
         # Compute conf
-        x[:, 5:] *= x[:, 4:5]  # conf = obj_conf * cls_conf
+        x[:, 9:] *= x[:, 8:9]  # conf = obj_conf * cls_conf
 
-        # Box/Mask
-        box = xywh2xyxy(x[:, :4])  # center_x, center_y, width, height) to (x1, y1, x2, y2)
+        # Keypoints to bounding box for NMS
+        kpts = x[:, :8]  # 4 keypoints (x1,y1,x2,y2,x3,y3,x4,y4)
+        xs = kpts[:, 0::2]  # all x coords
+        ys = kpts[:, 1::2]  # all y coords
+        box = torch.stack([xs.min(1)[0], ys.min(1)[0], xs.max(1)[0], ys.max(1)[0]], dim=1)  # enclosing xyxy
         mask = x[:, mi:]  # zero columns if no masks
 
-        # Detections matrix nx6 (xyxy, conf, cls)
+        # Detections matrix: (kpts_8, conf, cls)
         if multi_label:
-            i, j = (x[:, 5:mi] > conf_thres).nonzero(as_tuple=False).T
-            x = torch.cat((box[i], x[i, 5 + j, None], j[:, None].float(), mask[i]), 1)
+            i, j = (x[:, 9:mi] > conf_thres).nonzero(as_tuple=False).T
+            x = torch.cat((kpts[i], x[i, 9 + j, None], j[:, None].float(), mask[i]), 1)
+            box = box[i]
         else:  # best class only
-            conf, j = x[:, 5:mi].max(1, keepdim=True)
-            x = torch.cat((box, conf, j.float(), mask), 1)[conf.view(-1) > conf_thres]
+            conf, j = x[:, 9:mi].max(1, keepdim=True)
+            valid = conf.view(-1) > conf_thres
+            x = torch.cat((kpts, conf, j.float(), mask), 1)[valid]
+            box = box[valid]
 
         # Filter by class
         if classes is not None:
-            x = x[(x[:, 5:6] == torch.tensor(classes, device=x.device)).any(1)]
-
-        # Apply finite constraint
-        # if not torch.isfinite(x).all():
-        #     x = x[torch.isfinite(x).all(1)]
+            x = x[(x[:, 9:10] == torch.tensor(classes, device=x.device)).any(1)]
+            box = box[(x[:, 9:10] == torch.tensor(classes, device=x.device)).any(1)]
 
         # Check shape
-        n = x.shape[0]  # number of boxes
-        if not n:  # no boxes
+        n = x.shape[0]  # number of detections
+        if not n:
             continue
-        x = x[x[:, 4].argsort(descending=True)[:max_nms]]  # sort by confidence and remove excess boxes
+        sort_idx = x[:, 8].argsort(descending=True)[:max_nms]  # sort by conf (index 8)
+        x = x[sort_idx]
+        box = box[sort_idx]
 
         # Batched NMS
-        c = x[:, 5:6] * (0 if agnostic else max_wh)  # classes
-        boxes, scores = x[:, :4] + c, x[:, 4]  # boxes (offset by class), scores
-        i = torchvision.ops.nms(boxes, scores, iou_thres)  # NMS
-        i = i[:max_det]  # limit detections
-        if merge and (1 < n < 3e3):  # Merge NMS (boxes merged using weighted mean)
-            # update boxes as boxes(i,4) = weights(i,n) * boxes(n,4)
-            iou = box_iou(boxes[i], boxes) > iou_thres  # iou matrix
-            weights = iou * scores[None]  # box weights
-            x[i, :4] = torch.mm(weights, x[:, :4]).float() / weights.sum(1, keepdim=True)  # merged boxes
-            if redundant:
-                i = i[iou.sum(1) > 1]  # require redundancy
+        kpts_nms = x[:, :8]  # 4 keypoints
+        scores = x[:, 8]
+        
+        if polygon_nms_enabled:
+            # 使用多边形NMS（慢但精确）
+            if agnostic:
+                i = polygon_nms(kpts_nms, scores, iou_thres)
+                i = i[:max_det]
+            else:
+                i_list = []
+                for cls_id in x[:, 9].unique():
+                    cls_mask = x[:, 9] == cls_id
+                    cls_indices = torch.where(cls_mask)[0]
+                    cls_kpts = kpts_nms[cls_mask]
+                    cls_scores = scores[cls_mask]
+                    keep = polygon_nms(cls_kpts, cls_scores, iou_thres)
+                    i_list.append(cls_indices[keep])
+                i = torch.cat(i_list) if i_list else torch.tensor([], dtype=torch.long, device=x.device)
+                if len(i) > 0:
+                    i = i[x[i, 8].argsort(descending=True)][:max_det]
+        else:
+            # 使用外接框NMS（快）
+            c = x[:, 9:10] * (0 if agnostic else max_wh)  # classes
+            boxes_nms, scores = box + c, x[:, 8]  # boxes (offset by class), scores
+            i = torchvision.ops.nms(boxes_nms, scores, iou_thres)  # NMS
+            i = i[:max_det]
 
         output[xi] = x[i]
         if mps:

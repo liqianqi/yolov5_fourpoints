@@ -197,37 +197,35 @@ def random_perspective(
 
     if n := len(targets):
         use_segments = any(x.any() for x in segments) and len(segments) == n
-        new = np.zeros((n, 4))
-        if use_segments:  # warp segments
-            segments = resample_segments(segments)  # upsample
-            for i, segment in enumerate(segments):
-                xy = np.ones((len(segment), 3))
-                xy[:, :2] = segment
-                xy = xy @ M.T  # transform
-                xy = xy[:, :2] / xy[:, 2:3] if perspective else xy[:, :2]  # perspective rescale or affine
-
-                # clip
-                new[i] = segment2box(xy, width, height)
-
-        else:  # warp boxes
-            xy = np.ones((n * 4, 3))
-            xy[:, :2] = targets[:, [1, 2, 3, 4, 1, 4, 3, 2]].reshape(n * 4, 2)  # x1y1, x2y2, x1y2, x2y1
-            xy = xy @ M.T  # transform
-            xy = (xy[:, :2] / xy[:, 2:3] if perspective else xy[:, :2]).reshape(n, 8)  # perspective rescale or affine
-
-            # create new boxes
-            x = xy[:, [0, 2, 4, 6]]
-            y = xy[:, [1, 3, 5, 7]]
-            new = np.concatenate((x.min(1), y.min(1), x.max(1), y.max(1))).reshape(4, n).T
-
-            # clip
-            new[:, [0, 2]] = new[:, [0, 2]].clip(0, width)
-            new[:, [1, 3]] = new[:, [1, 3]].clip(0, height)
-
-        # filter candidates
-        i = box_candidates(box1=targets[:, 1:5].T * s, box2=new.T, area_thr=0.01 if use_segments else 0.10)
+        
+        # 变换4个关键点
+        kpts = targets[:, 1:9].reshape(-1, 2)  # (n*4, 2)
+        ones = np.ones((kpts.shape[0], 1))
+        kpts_h = np.concatenate([kpts, ones], axis=1)  # homogeneous coords
+        kpts_t = kpts_h @ M.T  # transform
+        kpts_t = kpts_t[:, :2] / kpts_t[:, 2:3] if perspective else kpts_t[:, :2]  # perspective rescale
+        kpts_t = kpts_t.reshape(-1, 8)
+        
+        # 用变换后的关键点计算外接框，用于过滤
+        x_coords = kpts_t[:, 0::2]  # (n, 4)
+        y_coords = kpts_t[:, 1::2]  # (n, 4)
+        new = np.stack([x_coords.min(1), y_coords.min(1), x_coords.max(1), y_coords.max(1)], axis=1)  # (n, 4) xyxy
+        
+        # 计算原始外接框用于过滤
+        orig_kpts = targets[:, 1:9].reshape(-1, 4, 2)
+        orig_x = orig_kpts[:, :, 0]
+        orig_y = orig_kpts[:, :, 1]
+        orig_box = np.stack([orig_x.min(1), orig_y.min(1), orig_x.max(1), orig_y.max(1)], axis=1)
+        
+        # filter candidates based on bounding box
+        i = box_candidates(box1=orig_box.T * s, box2=new.T, area_thr=0.10)
         targets = targets[i]
-        targets[:, 1:5] = new[i]
+        kpts_t = kpts_t[i]
+        
+        # clip keypoints and update targets
+        kpts_t[:, 0::2] = kpts_t[:, 0::2].clip(0, width)   # clip x
+        kpts_t[:, 1::2] = kpts_t[:, 1::2].clip(0, height)  # clip y
+        targets[:, 1:9] = kpts_t
 
     return im, targets
 
