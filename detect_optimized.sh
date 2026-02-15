@@ -3,10 +3,10 @@
 # 使用验证后的最佳NMS参数
 
 WEIGHTS="runs/train/exp4/weights/best.pt"
-CONF_THRES=0.4      # 置信度阈值
-IOU_THRES=0.3       # NMS IOU阈值 (降低后mAP提升5.5%)
+CONF_THRES=0.4 # 置信度阈值
+IOU_THRES=0.3  # NMS IOU阈值 (降低后mAP提升5.5%)
 IMG_SIZE=640
-MAX_DET=50          # 每张图最大检测数
+MAX_DET=50 # 每张图最大检测数
 
 # 检测单张图片
 # python detect.py --weights $WEIGHTS --source YOUR_IMAGE.jpg --conf-thres $CONF_THRES --iou-thres $IOU_THRES --img $IMG_SIZE --max-det $MAX_DET

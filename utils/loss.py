@@ -1,49 +1,42 @@
 # Ultralytics 🚀 AGPL-3.0 License - https://ultralytics.com/license
 """Loss functions."""
 
-import torch
-import torch.nn as nn
 import math
 
-from utils.metrics import bbox_iou
+import torch
+import torch.nn as nn
+
 from utils.torch_utils import de_parallel
 
 
 def wing_loss(pred, target, w=0.5, epsilon=0.1):
-    """
-    Wing Loss for keypoint regression.
-    More sensitive to small errors than L1/L2 loss.
-    
+    """Wing Loss for keypoint regression. More sensitive to small errors than L1/L2 loss.
+
     Args:
         pred: predicted keypoints (N, 8) - values typically in [-0.5, 1.5] range
         target: target keypoints (N, 8)
         w: wing width, controls the range of nonlinear part (adjusted for small coords)
         epsilon: curvature, smaller = more sensitive to small errors
-    
+
     Returns:
         Wing loss value
     """
     diff = torch.abs(pred - target)
     c = w * (1.0 - math.log(1.0 + w / epsilon))
-    
+
     # Wing loss: log for small errors, linear for large errors
-    loss = torch.where(
-        diff < w,
-        w * torch.log(1.0 + diff / epsilon),
-        diff - c
-    )
+    loss = torch.where(diff < w, w * torch.log(1.0 + diff / epsilon), diff - c)
     return loss.mean()
 
 
 def polygon_giou_loss(pred_kpts, target_kpts):
-    """
-    Polygon GIoU Loss using bounding box approximation.
-    Optimizes overall shape alignment, not just individual points.
-    
+    """Polygon GIoU Loss using bounding box approximation. Optimizes overall shape alignment, not just individual
+    points.
+
     Args:
         pred_kpts: predicted keypoints (N, 8) - x1,y1,x2,y2,x3,y3,x4,y4
         target_kpts: target keypoints (N, 8)
-    
+
     Returns:
         1 - GIoU (loss to minimize)
     """
@@ -52,41 +45,41 @@ def polygon_giou_loss(pred_kpts, target_kpts):
     pred_ys = pred_kpts[:, 1::2]  # (N, 4)
     target_xs = target_kpts[:, 0::2]
     target_ys = target_kpts[:, 1::2]
-    
+
     # Compute bounding boxes (xyxy format)
     pred_x1, pred_y1 = pred_xs.min(1)[0], pred_ys.min(1)[0]
     pred_x2, pred_y2 = pred_xs.max(1)[0], pred_ys.max(1)[0]
     target_x1, target_y1 = target_xs.min(1)[0], target_ys.min(1)[0]
     target_x2, target_y2 = target_xs.max(1)[0], target_ys.max(1)[0]
-    
+
     # Intersection
     inter_x1 = torch.max(pred_x1, target_x1)
     inter_y1 = torch.max(pred_y1, target_y1)
     inter_x2 = torch.min(pred_x2, target_x2)
     inter_y2 = torch.min(pred_y2, target_y2)
-    
+
     inter_w = (inter_x2 - inter_x1).clamp(min=0)
     inter_h = (inter_y2 - inter_y1).clamp(min=0)
     inter_area = inter_w * inter_h
-    
+
     # Union
     pred_area = (pred_x2 - pred_x1) * (pred_y2 - pred_y1)
     target_area = (target_x2 - target_x1) * (target_y2 - target_y1)
     union_area = pred_area + target_area - inter_area + 1e-7
-    
+
     # IoU
     iou = inter_area / union_area
-    
+
     # Enclosing box
     enclose_x1 = torch.min(pred_x1, target_x1)
     enclose_y1 = torch.min(pred_y1, target_y1)
     enclose_x2 = torch.max(pred_x2, target_x2)
     enclose_y2 = torch.max(pred_y2, target_y2)
     enclose_area = (enclose_x2 - enclose_x1) * (enclose_y2 - enclose_y1) + 1e-7
-    
+
     # GIoU
     giou = iou - (enclose_area - union_area) / enclose_area
-    
+
     return (1 - giou).mean()
 
 
@@ -225,7 +218,7 @@ class ComputeLoss:
         lcls = torch.zeros(1, device=self.device)  # class loss
         lbox = torch.zeros(1, device=self.device)  # box loss
         lobj = torch.zeros(1, device=self.device)  # object loss
-        tcls, tbox, indices, anchors = self.build_targets(p, targets)  # targets
+        tcls, tbox, indices, _anchors = self.build_targets(p, targets)  # targets
 
         # Losses
         for i, pi in enumerate(p):  # layer index, layer predictions
@@ -237,10 +230,10 @@ class ComputeLoss:
 
                 # Regression (keypoints)
                 pkpts = pkpts.sigmoid() * 2 - 0.5  # decode keypoints relative to grid cell
-                
+
                 # Keypoint regression loss: Smooth L1 + GIoU for shape alignment
                 # L1 损失用于关键点坐标精度，GIoU损失用于整体形状
-                loss_l1 = nn.functional.smooth_l1_loss(pkpts, tbox[i], reduction='mean', beta=0.5)
+                loss_l1 = nn.functional.smooth_l1_loss(pkpts, tbox[i], reduction="mean", beta=0.5)
                 loss_giou = polygon_giou_loss(pkpts, tbox[i])
                 lbox += loss_l1 + 1.0 * loss_giou  # 提高GIoU权重从0.5到1.0
 
@@ -307,7 +300,7 @@ class ComputeLoss:
                 bbox_w = xs.max(-1)[0] - xs.min(-1)[0]  # 外接框宽度
                 bbox_h = ys.max(-1)[0] - ys.min(-1)[0]  # 外接框高度
                 bbox_wh = torch.stack([bbox_w, bbox_h], dim=-1)  # (na, nt, 2)
-                
+
                 # Matches - 用外接框的wh与anchor匹配
                 r = bbox_wh / anchors[:, None]  # wh ratio
                 j = torch.max(r, 1 / r).max(2)[0] < self.hyp["anchor_t"]  # compare
@@ -328,7 +321,7 @@ class ComputeLoss:
                 jj = torch.stack((torch.ones_like(jj), jj, k, l, m))
                 t = t.repeat((5, 1, 1))[jj]
                 offsets = (torch.zeros_like(gxy)[None] + off[:, None])[jj]
-                
+
                 # 重新计算gxy
                 kpts_t = t[:, 2:10]
                 xs_t = kpts_t[:, 0::2]
@@ -347,9 +340,9 @@ class ComputeLoss:
                 gxy = torch.stack([cx_t, cy_t], dim=-1)
 
             # Define
-            bc = t[:, :2]          # (image_idx, class)
-            a = t[:, -1].long()    # anchor index (last column)
-            b, c = bc.long().T     # image, class
+            bc = t[:, :2]  # (image_idx, class)
+            a = t[:, -1].long()  # anchor index (last column)
+            b, c = bc.long().T  # image, class
             gij = (gxy - offsets).long()
             gi, gj = gij.T  # grid indices
 
@@ -360,7 +353,7 @@ class ComputeLoss:
             gkpts = t[:, 2:10]  # keypoints in grid space
             gkpts_rel = gkpts.clone()
             for p_idx in range(4):
-                gkpts_rel[:, p_idx * 2] -= gij[:, 0].float()      # relative to grid_x
+                gkpts_rel[:, p_idx * 2] -= gij[:, 0].float()  # relative to grid_x
                 gkpts_rel[:, p_idx * 2 + 1] -= gij[:, 1].float()  # relative to grid_y
             tbox.append(gkpts_rel)
 

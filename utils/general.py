@@ -49,7 +49,7 @@ from ultralytics.utils.patches import torch_load
 
 from utils import TryExcept, emojis
 from utils.downloads import curl_download, gsutil_getsize
-from utils.metrics import box_iou, fitness
+from utils.metrics import fitness
 
 FILE = Path(__file__).resolve()
 ROOT = FILE.parents[1]  # YOLOv5 root directory
@@ -989,7 +989,7 @@ def clip_keypoints(keypoints, shape):
 
 
 def polygon_area(poly):
-    """计算多边形面积（Shoelace公式）。poly: (n, 2) 或 (4, 2)"""
+    """计算多边形面积（Shoelace公式）。poly: (n, 2) 或 (4, 2)."""
     n = len(poly)
     area = 0.0
     for i in range(n):
@@ -1000,38 +1000,39 @@ def polygon_area(poly):
 
 
 def polygon_intersection(poly1, poly2):
-    """使用Sutherland-Hodgman算法计算两个凸多边形的交集。"""
+    """使用Sutherland-Hodgman算法计算两个凸多边形的交集。."""
+
     def clip_polygon_by_edge(polygon, p1, p2):
-        """用边p1->p2裁剪多边形"""
+        """用边p1->p2裁剪多边形."""
         if len(polygon) == 0:
             return polygon
-        
+
         clipped = []
         for i in range(len(polygon)):
             curr = polygon[i]
             prev = polygon[i - 1]
-            
+
             # 计算点相对于边的位置
             d_curr = (p2[0] - p1[0]) * (curr[1] - p1[1]) - (p2[1] - p1[1]) * (curr[0] - p1[0])
             d_prev = (p2[0] - p1[0]) * (prev[1] - p1[1]) - (p2[1] - p1[1]) * (prev[0] - p1[0])
-            
+
             if d_curr >= 0:  # 当前点在边内侧
                 if d_prev < 0:  # 前一个点在外侧，添加交点
                     t = d_prev / (d_prev - d_curr)
                     intersect = [prev[0] + t * (curr[0] - prev[0]), prev[1] + t * (curr[1] - prev[1])]
                     clipped.append(intersect)
-                clipped.append(curr.tolist() if hasattr(curr, 'tolist') else list(curr))
+                clipped.append(curr.tolist() if hasattr(curr, "tolist") else list(curr))
             elif d_prev >= 0:  # 当前点在外侧，前一个点在内侧
                 t = d_prev / (d_prev - d_curr)
                 intersect = [prev[0] + t * (curr[0] - prev[0]), prev[1] + t * (curr[1] - prev[1])]
                 clipped.append(intersect)
-        
+
         return clipped
 
     # 确保多边形是逆时针方向
     def ensure_ccw(poly):
-        """确保多边形顶点按逆时针顺序排列"""
-        pts = [p.tolist() if hasattr(p, 'tolist') else list(p) for p in poly]
+        """确保多边形顶点按逆时针顺序排列."""
+        pts = [p.tolist() if hasattr(p, "tolist") else list(p) for p in poly]
         # 计算有符号面积
         area = 0
         n = len(pts)
@@ -1042,126 +1043,122 @@ def polygon_intersection(poly1, poly2):
         if area < 0:  # 顺时针，需要反转
             pts = pts[::-1]
         return pts
-    
+
     result = ensure_ccw(poly1)
     poly2_ccw = ensure_ccw(poly2)
-    
+
     for i in range(len(poly2_ccw)):
         if len(result) == 0:
             break
         p1 = poly2_ccw[i]
         p2 = poly2_ccw[(i + 1) % len(poly2_ccw)]
         result = clip_polygon_by_edge(result, p1, p2)
-    
+
     return np.array(result) if len(result) > 0 else np.array([]).reshape(0, 2)
 
 
 def polygon_iou_single(poly1, poly2, return_iomin=False):
-    """计算两个四边形的IoU。poly1, poly2: (4, 2)
-    
+    """计算两个四边形的IoU。poly1, poly2: (4, 2).
+
     Args:
         poly1, poly2: 四边形顶点坐标 (4, 2)
         return_iomin: 是否同时返回IoMin (用于检测包含关系)
-    
+
     Returns:
         如果 return_iomin=False: IoU
         如果 return_iomin=True: (IoU, IoMin)
     """
     area1 = polygon_area(poly1)
     area2 = polygon_area(poly2)
-    
+
     if area1 < 1e-6 or area2 < 1e-6:
         return (0.0, 0.0) if return_iomin else 0.0
-    
+
     # 计算交集
     intersection = polygon_intersection(poly1, poly2)
     if len(intersection) < 3:
         return (0.0, 0.0) if return_iomin else 0.0
-    
+
     inter_area = polygon_area(intersection)
     union_area = area1 + area2 - inter_area
-    
+
     if union_area < 1e-6:
         return (0.0, 0.0) if return_iomin else 0.0
-    
+
     iou = inter_area / union_area
-    
+
     if return_iomin:
         # IoMin: 交集/最小框面积，用于检测包含关系
         # 当一个框完全包含另一个时，IoMin ≈ 1.0
         min_area = min(area1, area2)
         iomin = inter_area / min_area if min_area > 1e-6 else 0.0
         return iou, iomin
-    
+
     return iou
 
 
 def polygon_iou_batch(kpts1, kpts2):
-    """批量计算多边形IoU。kpts1: (N, 8), kpts2: (M, 8)。返回 (N, M) IoU矩阵"""
+    """批量计算多边形IoU。kpts1: (N, 8), kpts2: (M, 8)。返回 (N, M) IoU矩阵."""
     n = kpts1.shape[0]
     m = kpts2.shape[0]
     iou_matrix = np.zeros((n, m))
-    
+
     for i in range(n):
         poly1 = kpts1[i].reshape(4, 2)
         for j in range(m):
             poly2 = kpts2[j].reshape(4, 2)
             iou_matrix[i, j] = polygon_iou_single(poly1, poly2)
-    
+
     return iou_matrix
 
 
 def polygon_nms(kpts, scores, iou_thres, iomin_thres=0.6):
-    """基于多边形IoU的NMS，同时检测包含关系。
-    
+    """基于多边形IoU的NMS，同时检测包含关系。.
+
     Args:
         kpts: 关键点坐标 (N, 8)
         scores: 置信度分数 (N,)
         iou_thres: IoU阈值，大于此值的框会被抑制
         iomin_thres: IoMin阈值，用于检测包含关系（一个框包含另一个）
-    
+
     Returns:
         保留的索引
     """
     if len(kpts) == 0:
         return np.array([], dtype=np.int64)
-    
+
     # 转为numpy
     if isinstance(kpts, torch.Tensor):
         kpts = kpts.cpu().numpy()
     if isinstance(scores, torch.Tensor):
         scores = scores.cpu().numpy()
-    
+
     # 按分数排序
     order = scores.argsort()[::-1]
     keep = []
-    
+
     while len(order) > 0:
         i = order[0]
         keep.append(i)
-        
+
         if len(order) == 1:
             break
-        
+
         # 计算当前框与其余框的IoU和IoMin
         remaining = order[1:]
         suppress_mask = np.zeros(len(remaining), dtype=bool)
-        
+
         for idx, j in enumerate(remaining):
-            iou, iomin = polygon_iou_single(
-                kpts[i].reshape(4, 2), 
-                kpts[j].reshape(4, 2), 
-                return_iomin=True
-            )
+            iou, iomin = polygon_iou_single(kpts[i].reshape(4, 2), kpts[j].reshape(4, 2), return_iomin=True)
             # 满足任一条件则抑制：
             # 1. IoU > 阈值（传统NMS）
             # 2. IoMin > 阈值（一个框包含另一个）
             if iou > iou_thres or iomin > iomin_thres:
                 suppress_mask[idx] = True
-        
+
         # 保留未被抑制的框
         order = remaining[~suppress_mask]
-    
+
     return np.array(keep, dtype=np.int64)
 
 
@@ -1242,9 +1239,7 @@ def non_max_suppression(
     max_wh = 7680  # (pixels) maximum box width and height
     max_nms = 30000  # maximum number of boxes into torchvision.ops.nms()
     time_limit = 0.5 + 0.05 * bs  # seconds to quit after
-    redundant = True  # require redundant detections
     multi_label &= nc > 1  # multiple labels per box (adds 0.5ms/img)
-    merge = False  # use merge-NMS
 
     t = time.time()
     mi = 9 + nc  # mask start index (8 keypoints + 1 obj + nc classes)
@@ -1304,7 +1299,7 @@ def non_max_suppression(
         # Batched NMS
         kpts_nms = x[:, :8]  # 4 keypoints
         scores = x[:, 8]
-        
+
         if polygon_nms_enabled:
             # 使用多边形NMS（慢但精确）
             if agnostic:

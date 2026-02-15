@@ -6,10 +6,10 @@ weights: runs/train/exp4/weights/best.pt
 
 # 推理参数
 img_size: 640
-conf_thres: 0.4       # 置信度阈值 (平衡精度和召回)
-iou_thres: 0.3        # NMS IOU阈值 (降低后mAP@0.5从0.309提升到0.326)
-max_det: 50           # 每张图最大检测数
-device: 0             # GPU设备
+conf_thres: 0.4 # 置信度阈值 (平衡精度和召回)
+iou_thres: 0.3 # NMS IOU阈值 (降低后mAP@0.5从0.309提升到0.326)
+max_det: 50 # 每张图最大检测数
+device: 0 # GPU设备
 
 # 验证集性能 (iou_thres=0.3)
 # Precision: 0.494
@@ -19,4 +19,4 @@ device: 0             # GPU设备
 
 # 数据集信息
 data: data/data36.yaml
-nc: 36                # 类别数
+nc: 36 # 类别数
