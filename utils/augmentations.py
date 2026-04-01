@@ -10,7 +10,7 @@ import torch
 import torchvision.transforms as T
 import torchvision.transforms.functional as TF
 
-from utils.general import LOGGER, check_version, colorstr, resample_segments, segment2box, xywhn2xyxy
+from utils.general import LOGGER, check_version, colorstr, xywhn2xyxy
 from utils.metrics import bbox_ioa
 
 IMAGENET_MEAN = 0.485, 0.456, 0.406  # RGB mean
@@ -196,8 +196,8 @@ def random_perspective(
             im = cv2.warpAffine(im, M[:2], dsize=(width, height), borderValue=(114, 114, 114))
 
     if n := len(targets):
-        use_segments = any(x.any() for x in segments) and len(segments) == n
-        
+        any(x.any() for x in segments) and len(segments) == n
+
         # 变换4个关键点
         kpts = targets[:, 1:9].reshape(-1, 2)  # (n*4, 2)
         ones = np.ones((kpts.shape[0], 1))
@@ -205,25 +205,25 @@ def random_perspective(
         kpts_t = kpts_h @ M.T  # transform
         kpts_t = kpts_t[:, :2] / kpts_t[:, 2:3] if perspective else kpts_t[:, :2]  # perspective rescale
         kpts_t = kpts_t.reshape(-1, 8)
-        
+
         # 用变换后的关键点计算外接框，用于过滤
         x_coords = kpts_t[:, 0::2]  # (n, 4)
         y_coords = kpts_t[:, 1::2]  # (n, 4)
         new = np.stack([x_coords.min(1), y_coords.min(1), x_coords.max(1), y_coords.max(1)], axis=1)  # (n, 4) xyxy
-        
+
         # 计算原始外接框用于过滤
         orig_kpts = targets[:, 1:9].reshape(-1, 4, 2)
         orig_x = orig_kpts[:, :, 0]
         orig_y = orig_kpts[:, :, 1]
         orig_box = np.stack([orig_x.min(1), orig_y.min(1), orig_x.max(1), orig_y.max(1)], axis=1)
-        
+
         # filter candidates based on bounding box
         i = box_candidates(box1=orig_box.T * s, box2=new.T, area_thr=0.10)
         targets = targets[i]
         kpts_t = kpts_t[i]
-        
+
         # clip keypoints and update targets
-        kpts_t[:, 0::2] = kpts_t[:, 0::2].clip(0, width)   # clip x
+        kpts_t[:, 0::2] = kpts_t[:, 0::2].clip(0, width)  # clip x
         kpts_t[:, 1::2] = kpts_t[:, 1::2].clip(0, height)  # clip y
         targets[:, 1:9] = kpts_t
 
