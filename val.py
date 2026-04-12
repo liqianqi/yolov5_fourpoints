@@ -51,11 +51,8 @@ from utils.general import (
     colorstr,
     increment_path,
     non_max_suppression,
-    polygon_iou_batch,
     print_args,
-    scale_boxes,
     scale_keypoints,
-    xywh2xyxy,
     xyxy2xywh,
 )
 from utils.metrics import ConfusionMatrix, ap_per_class, box_iou
@@ -159,28 +156,28 @@ def process_batch(detections, labels, iouv):
 
 
 def process_batch_polygon(detections, labels, iouv):
-    """使用外接框IoU评估检测结果（更快更稳定）。
-    detections: (N, 10) - [kpts(8), conf, cls]
-    labels: (M, 9) - [cls, kpts(8)]
+    """使用外接框IoU评估检测结果（更快更稳定）。 detections: (N, 10) - [kpts(8), conf, cls] labels: (M, 9) - [cls, kpts(8)].
     """
     correct = np.zeros((detections.shape[0], iouv.shape[0])).astype(bool)
-    
+
     # 从关键点计算外接框
     det_kpts = detections[:, :8]
     det_xs = det_kpts[:, 0::2]  # (N, 4)
     det_ys = det_kpts[:, 1::2]
-    det_boxes = torch.stack([det_xs.min(1)[0], det_ys.min(1)[0], 
-                             det_xs.max(1)[0], det_ys.max(1)[0]], dim=1)  # (N, 4) xyxy
-    
+    det_boxes = torch.stack(
+        [det_xs.min(1)[0], det_ys.min(1)[0], det_xs.max(1)[0], det_ys.max(1)[0]], dim=1
+    )  # (N, 4) xyxy
+
     lbl_kpts = labels[:, 1:9]
     lbl_xs = lbl_kpts[:, 0::2]  # (M, 4)
     lbl_ys = lbl_kpts[:, 1::2]
-    lbl_boxes = torch.stack([lbl_xs.min(1)[0], lbl_ys.min(1)[0],
-                             lbl_xs.max(1)[0], lbl_ys.max(1)[0]], dim=1)  # (M, 4) xyxy
-    
+    lbl_boxes = torch.stack(
+        [lbl_xs.min(1)[0], lbl_ys.min(1)[0], lbl_xs.max(1)[0], lbl_ys.max(1)[0]], dim=1
+    )  # (M, 4) xyxy
+
     # 计算外接框IoU
     iou = box_iou(lbl_boxes, det_boxes)  # (M, N)
-    
+
     correct_class = labels[:, 0:1] == detections[:, 9]
     for i in range(len(iouv)):
         x = torch.where((iou >= iouv[i]) & correct_class)
@@ -362,8 +359,14 @@ def run(
         with dt[2]:
             # Use agnostic NMS: each location can only have one class (mutually exclusive)
             preds = non_max_suppression(
-                preds, conf_thres, iou_thres, labels=lb, multi_label=False, agnostic=True, max_det=max_det,
-                polygon_nms_enabled=False  # Disabled for speed during training
+                preds,
+                conf_thres,
+                iou_thres,
+                labels=lb,
+                multi_label=False,
+                agnostic=True,
+                max_det=max_det,
+                polygon_nms_enabled=False,  # Disabled for speed during training
             )
 
         # Metrics
@@ -400,7 +403,9 @@ def run(
                     pred_kpts = predn[:, :8]
                     pred_xs = pred_kpts[:, 0::2]
                     pred_ys = pred_kpts[:, 1::2]
-                    pred_boxes = torch.stack([pred_xs.min(1)[0], pred_ys.min(1)[0], pred_xs.max(1)[0], pred_ys.max(1)[0]], 1)
+                    pred_boxes = torch.stack(
+                        [pred_xs.min(1)[0], pred_ys.min(1)[0], pred_xs.max(1)[0], pred_ys.max(1)[0]], 1
+                    )
                     predn_std = torch.cat((pred_boxes, predn[:, 8:10]), 1)
                     t_xs = tkpts[:, 0::2]
                     t_ys = tkpts[:, 1::2]
