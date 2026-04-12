@@ -53,7 +53,6 @@ from utils.general import (
     xyn2xy,
     xywh2xyxy,
     xywhn2xyxy,
-    xyxy2xywhn,
 )
 from utils.torch_utils import torch_distributed_zero_first
 
