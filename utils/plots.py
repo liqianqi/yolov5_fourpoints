@@ -138,9 +138,9 @@ def butter_lowpass_filtfilt(data, cutoff=1500, fs=50000, order=5):
 
 def output_to_target(output, max_det=300):
     """Converts YOLOv5 model output to target format for plotting, limiting detections to `max_det`.
-    
-    For keypoint model: output is [x1,y1,x2,y2,x3,y3,x4,y4,conf,cls]
-    Returns: [batch_id, cls, x1,y1,x2,y2,x3,y3,x4,y4, conf] for keypoint format
+
+    For keypoint model: output is [x1,y1,x2,y2,x3,y3,x4,y4,conf,cls] Returns: [batch_id, cls, x1,y1,x2,y2,x3,y3,x4,y4,
+    conf] for keypoint format
     """
     targets = []
     for i, o in enumerate(output):
@@ -202,14 +202,14 @@ def plot_images(images, targets, paths=None, fname="images.jpg", names=None):
             ti = targets[targets[:, 0] == i]  # image targets
             classes = ti[:, 1].astype("int")
             ncols = ti.shape[1]
-            
+
             # Determine format: 4-point keypoints (10/11 cols) or bbox (6/7 cols)
             if ncols >= 10:
                 # 4-point keypoint format: [img_idx, cls, x1, y1, x2, y2, x3, y3, x4, y4, (conf)]
                 labels = ncols == 10  # labels if no conf column
                 conf = None if labels else ti[:, 10]
                 kpts = ti[:, 2:10].copy()  # (n, 8)
-                
+
                 if kpts.shape[0] > 0:
                     if kpts.max() <= 1.01:
                         kpts[:, 0::2] *= w
@@ -218,7 +218,7 @@ def plot_images(images, targets, paths=None, fname="images.jpg", names=None):
                         kpts *= scale
                 kpts[:, 0::2] += x
                 kpts[:, 1::2] += y
-                
+
                 for j in range(len(kpts)):
                     cls = classes[j]
                     color = colors(cls)
@@ -231,15 +231,22 @@ def plot_images(images, targets, paths=None, fname="images.jpg", names=None):
                             pt1 = tuple(pts[k])
                             pt2 = tuple(pts[(k + 1) % 4])
                             cv2.line(im, pt1, pt2, color, thickness=max(1, round(fs / 10)))
-                        cv2.putText(im, label, (pts[0][0], pts[0][1] - 5), cv2.FONT_HERSHEY_SIMPLEX, 
-                                    fs / 30, color, thickness=max(1, round(fs / 15)))
+                        cv2.putText(
+                            im,
+                            label,
+                            (pts[0][0], pts[0][1] - 5),
+                            cv2.FONT_HERSHEY_SIMPLEX,
+                            fs / 30,
+                            color,
+                            thickness=max(1, round(fs / 15)),
+                        )
                         annotator.im = Image.fromarray(im)
             else:
                 # Original bbox format: [img_idx, cls, cx, cy, w, h, (conf)]
                 boxes = xywh2xyxy(ti[:, 2:6]).T
                 labels = ncols == 6
                 conf = None if labels else ti[:, 6]
-                
+
                 if boxes.shape[1]:
                     if boxes.max() <= 1.01:
                         boxes[[0, 2]] *= w

@@ -59,10 +59,8 @@ from utils.general import (
     increment_path,
     non_max_suppression,
     print_args,
-    scale_boxes,
     scale_keypoints,
     strip_optimizer,
-    xyxy2xywh,
 )
 from utils.torch_utils import select_device, smart_inference_mode
 
@@ -209,8 +207,9 @@ def run(
         with dt[2]:
             # Use agnostic NMS: each location can only have one class
             # 启用多边形NMS，更精确地处理关键点检测
-            pred = non_max_suppression(pred, conf_thres, iou_thres, classes, agnostic=True, max_det=max_det,
-                                       polygon_nms_enabled=True)  # 使用多边形NMS
+            pred = non_max_suppression(
+                pred, conf_thres, iou_thres, classes, agnostic=True, max_det=max_det, polygon_nms_enabled=True
+            )  # 使用多边形NMS
 
         # Second-stage classifier (optional)
         # pred = utils.general.apply_classifier(pred, classifier_model, im, im0s)
@@ -242,7 +241,7 @@ def run(
             save_path = str(save_dir / p.name)  # im.jpg
             txt_path = str(save_dir / "labels" / p.stem) + ("" if dataset.mode == "image" else f"_{frame}")  # im.txt
             s += "{:g}x{:g} ".format(*im.shape[2:])  # print string
-            gn = torch.tensor(im0.shape)[[1, 0, 1, 0, 1, 0, 1, 0]]  # normalization gain for 4 keypoints
+            torch.tensor(im0.shape)[[1, 0, 1, 0, 1, 0, 1, 0]]  # normalization gain for 4 keypoints
             imc = im0.copy() if save_crop else im0  # for save_crop
             annotator = Annotator(im0, line_width=line_thickness, example=str(names))
             if len(det):
@@ -276,14 +275,13 @@ def run(
                         c = int(cls)  # integer class
                         label = None if hide_labels else (names[c] if hide_conf else f"{names[c]} {conf:.2f}")
                         # 绘制四边形（4个点连线）
-                        pts = [(int(kpts[i]), int(kpts[i+1])) for i in range(0, 8, 2)]
+                        pts = [(int(kpts[i]), int(kpts[i + 1])) for i in range(0, 8, 2)]
                         color = colors(c, True)
                         for i in range(4):
-                            cv2.line(im0, pts[i], pts[(i+1) % 4], color, line_thickness)
+                            cv2.line(im0, pts[i], pts[(i + 1) % 4], color, line_thickness)
                         if label:
                             # 在第一个点附近绘制标签
-                            cv2.putText(im0, label, (pts[0][0], pts[0][1] - 5), 
-                                       cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
+                            cv2.putText(im0, label, (pts[0][0], pts[0][1] - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
                     if save_crop:
                         # 用外接框裁剪
                         xs = [kpts[i] for i in range(0, 8, 2)]

@@ -112,8 +112,12 @@ class Detect(nn.Module):
                     # Note: self.grid has -0.5 offset built-in, so we add 0.5 back to get correct gij
                     kpts_decoded = kpts.clone()
                     for p in range(4):
-                        kpts_decoded[..., p * 2] = (kpts[..., p * 2] * 2 - 0.5 + self.grid[i][..., 0] + 0.5) * self.stride[i]
-                        kpts_decoded[..., p * 2 + 1] = (kpts[..., p * 2 + 1] * 2 - 0.5 + self.grid[i][..., 1] + 0.5) * self.stride[i]
+                        kpts_decoded[..., p * 2] = (
+                            kpts[..., p * 2] * 2 - 0.5 + self.grid[i][..., 0] + 0.5
+                        ) * self.stride[i]
+                        kpts_decoded[..., p * 2 + 1] = (
+                            kpts[..., p * 2 + 1] * 2 - 0.5 + self.grid[i][..., 1] + 0.5
+                        ) * self.stride[i]
                     y = torch.cat((kpts_decoded, conf), 4)
                 z.append(y.view(bs, self.na * nx * ny, self.no))
 
