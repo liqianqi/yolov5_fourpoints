@@ -19,8 +19,8 @@ import pandas as pd
 import requests
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from PIL import Image
-from torch.cuda import amp
 
 # Import 'ultralytics' package or install if missing
 try:
@@ -336,6 +336,106 @@ class SPPF(nn.Module):
             y1 = self.m(x)
             y2 = self.m(y1)
             return self.cv2(torch.cat((x, y1, y2, self.m(y2)), 1))
+
+
+def channel_shuffle(x, groups=2):
+    """ShuffleNet 通道混洗操作。"""
+    b, c, h, w = x.shape
+    x = x.view(b, groups, c // groups, h, w).transpose(1, 2).contiguous()
+    return x.view(b, c, h, w)
+
+
+class ShuffleV2Block(nn.Module):
+    """ShuffleNetV2 基本单元 (Ma et al. 2018)。stride=1 时通道二分+右分支卷积, stride=2 时双分支下采样。"""
+
+    def __init__(self, c1, c2, s=1):
+        super().__init__()
+        self.s = s
+        branch_c = c2 // 2
+        if s == 1:
+            assert c1 == c2, f"stride=1 requires c1==c2, got {c1}, {c2}"
+            in_c = c1 // 2
+        else:
+            in_c = c1
+            # 左分支: dw conv 下采样 + pw conv
+            self.branch1 = nn.Sequential(
+                nn.Conv2d(in_c, in_c, 3, s, 1, groups=in_c, bias=False),
+                nn.BatchNorm2d(in_c),
+                nn.Conv2d(in_c, branch_c, 1, 1, 0, bias=False),
+                nn.BatchNorm2d(branch_c),
+                nn.ReLU(inplace=True),
+            )
+        # 右分支: pw -> dw -> pw
+        self.branch2 = nn.Sequential(
+            nn.Conv2d(in_c, branch_c, 1, 1, 0, bias=False),
+            nn.BatchNorm2d(branch_c),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(branch_c, branch_c, 3, s, 1, groups=branch_c, bias=False),
+            nn.BatchNorm2d(branch_c),
+            nn.Conv2d(branch_c, branch_c, 1, 1, 0, bias=False),
+            nn.BatchNorm2d(branch_c),
+            nn.ReLU(inplace=True),
+        )
+
+    def forward(self, x):
+        if self.s == 1:
+            x1, x2 = x.chunk(2, dim=1)
+            out = torch.cat((x1, self.branch2(x2)), 1)
+        else:
+            out = torch.cat((self.branch1(x), self.branch2(x)), 1)
+        return channel_shuffle(out, 2)
+
+
+class SEBlock(nn.Module):
+    """MobileNetV3 Squeeze-and-Excitation 模块 (hard-sigmoid 门控)。"""
+
+    def __init__(self, c, r=4):
+        super().__init__()
+        c_ = max(c // r, 8)
+        self.fc1 = nn.Conv2d(c, c_, 1)
+        self.fc2 = nn.Conv2d(c_, c, 1)
+
+    def forward(self, x):
+        s = x.mean((2, 3), keepdim=True)
+        s = F.relu(self.fc1(s), inplace=True)
+        s = F.hardsigmoid(self.fc2(s), inplace=True)
+        return x * s
+
+
+class MBV3Block(nn.Module):
+    """MobileNetV3 InvertedResidual 单元 (Howard et al. 2019)。
+
+    Args:
+        c1, c2: 输入/输出通道
+        k: depthwise 卷积核
+        s: stride
+        c_exp: 扩张通道数
+        se: 是否使用 SE
+        hs: True 用 hardswish, False 用 ReLU
+    """
+
+    def __init__(self, c1, c2, k=3, s=1, c_exp=None, se=False, hs=True):
+        super().__init__()
+        c_exp = c_exp or c1 * 4
+        self.residual = s == 1 and c1 == c2
+        act = nn.Hardswish if hs else nn.ReLU
+        layers = []
+        if c_exp != c1:  # expand
+            layers += [nn.Conv2d(c1, c_exp, 1, bias=False), nn.BatchNorm2d(c_exp), act(inplace=True)]
+        # depthwise
+        layers += [
+            nn.Conv2d(c_exp, c_exp, k, s, k // 2, groups=c_exp, bias=False),
+            nn.BatchNorm2d(c_exp),
+            act(inplace=True),
+        ]
+        if se:
+            layers.append(SEBlock(c_exp))
+        # project (linear)
+        layers += [nn.Conv2d(c_exp, c2, 1, bias=False), nn.BatchNorm2d(c2)]
+        self.conv = nn.Sequential(*layers)
+
+    def forward(self, x):
+        return x + self.conv(x) if self.residual else self.conv(x)
 
 
 class Focus(nn.Module):
@@ -869,7 +969,7 @@ class AutoShape(nn.Module):
             p = next(self.model.parameters()) if self.pt else torch.empty(1, device=self.model.device)  # param
             autocast = self.amp and (p.device.type != "cpu")  # Automatic Mixed Precision (AMP) inference
             if isinstance(ims, torch.Tensor):  # torch
-                with amp.autocast(autocast):
+                with torch.amp.autocast("cuda", enabled=autocast):
                     return self.model(ims.to(p.device).type_as(p), augment=augment)  # inference
 
             # Pre-process
@@ -896,7 +996,7 @@ class AutoShape(nn.Module):
             x = np.ascontiguousarray(np.array(x).transpose((0, 3, 1, 2)))  # stack and BHWC to BCHW
             x = torch.from_numpy(x).to(p.device).type_as(p) / 255  # uint8 to fp16/32
 
-        with amp.autocast(autocast):
+        with torch.amp.autocast("cuda", enabled=autocast):
             # Inference
             with dt[1]:
                 y = self.model(x, augment=augment)  # forward

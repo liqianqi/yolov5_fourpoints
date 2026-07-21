@@ -47,7 +47,9 @@ from models.common import (
     Focus,
     GhostBottleneck,
     GhostConv,
+    MBV3Block,
     Proto,
+    ShuffleV2Block,
 )
 from models.experimental import MixConv2d
 from utils.autoanchor import check_anchor_order
@@ -76,14 +78,19 @@ class Detect(nn.Module):
     dynamic = False  # force grid reconstruction
     export = False  # export mode
 
-    def __init__(self, nc=80, anchors=(), ch=(), inplace=True):
+    def __init__(self, nc=80, anchors=(), ch=(), inplace=True, ncolor=2):
         """Initializes YOLOv5 detection layer with specified classes, anchors, channels, and inplace operations."""
         super().__init__()
-        self.nc = nc  # number of classes
-        self.no = nc + 9  # number of outputs per anchor: 8 keypoints + 1 obj + nc classes
+        self.nc = nc  # number of classes (joint: ncolor * ndigit)
+        # 双分支分类头: 颜色(ncolor) + 数字(ndigit)，联合类别 id = color * ndigit + digit
+        self.ncolor = ncolor
+        assert nc % ncolor == 0, f"nc={nc} must be divisible by ncolor={ncolor}"
+        self.ndigit = nc // ncolor
+        self.no = 8 + 1 + self.ncolor + self.ndigit  # raw outputs per anchor: 8 kpts + 1 obj + color + digit
+        self.no_out = 8 + 1 + nc  # inference outputs per anchor: kpts + obj + joint class scores
         self.nl = len(anchors)  # number of detection layers
         self.na = len(anchors[0]) // 2  # number of anchors
-        self.grid = [torch.empty(0) for _ in range(self.nl)]  # init grid
+        self.grid = [torch.empty(0) for _ in range(self.nl)]  # init grid 【0, 0, 0】
         self.anchor_grid = [torch.empty(0) for _ in range(self.nl)]  # init anchor grid
         self.register_buffer("anchors", torch.tensor(anchors).float().view(self.nl, -1, 2))  # shape(nl,na,2)
         self.m = nn.ModuleList(nn.Conv2d(x, self.no * self.na, 1) for x in ch)  # output conv
@@ -107,15 +114,19 @@ class Detect(nn.Module):
                     wh = (wh.sigmoid() * 2) ** 2 * self.anchor_grid[i]  # wh
                     y = torch.cat((xy, wh, conf.sigmoid(), mask), 4)
                 else:  # Detect (keypoints)
-                    kpts, conf = x[i].sigmoid().split((8, self.nc + 1), 4)
-                    # decode each keypoint relative to grid cell
-                    # Note: self.grid has -0.5 offset built-in, so we add 0.5 back to get correct gij
+                    kpts, conf = x[i].split((8, 1 + self.ncolor + self.ndigit), 4)
+                    obj, pcolor, pdigit = conf.sigmoid().split((1, self.ncolor, self.ndigit), 4)
+                    # anchor 尺度归一解码 (yolov5-face 风格): 关键点为线性输出(无 sigmoid, 无界),
+                    # 偏移量以 anchor 宽高为单位, 相对于所在 cell 左上角 (grid 含 -0.5 偏移, +0.5 还原)
+                    # kpt_pixel = raw * anchor_pixel + cell_corner_pixel
                     kpts_decoded = kpts.clone()
                     for p in range(4):
-                        kpts_decoded[..., p * 2] = (kpts[..., p * 2] * 2 - 0.5 + self.grid[i][..., 0] + 0.5) * self.stride[i]
-                        kpts_decoded[..., p * 2 + 1] = (kpts[..., p * 2 + 1] * 2 - 0.5 + self.grid[i][..., 1] + 0.5) * self.stride[i]
-                    y = torch.cat((kpts_decoded, conf), 4)
-                z.append(y.view(bs, self.na * nx * ny, self.no))
+                        kpts_decoded[..., p * 2] = kpts[..., p * 2] * self.anchor_grid[i][..., 0] + (self.grid[i][..., 0] + 0.5) * self.stride[i]
+                        kpts_decoded[..., p * 2 + 1] = kpts[..., p * 2 + 1] * self.anchor_grid[i][..., 1] + (self.grid[i][..., 1] + 0.5) * self.stride[i]
+                    # 双分支合并为联合类别分数: P(cls=c*ndigit+d) = P(color=c) * P(digit=d)
+                    joint = (pcolor.unsqueeze(-1) * pdigit.unsqueeze(-2)).flatten(-2)  # (..., ncolor*ndigit)
+                    y = torch.cat((kpts_decoded, obj, joint), 4)
+                z.append(y.view(bs, self.na * nx * ny, self.no_out))
 
         return x if self.training else (torch.cat(z, 1),) if self.export else (torch.cat(z, 1), x)
 
@@ -326,11 +337,10 @@ class DetectionModel(BaseModel):
         # cf = torch.bincount(torch.tensor(np.concatenate(dataset.labels, 0)[:, 0]).long(), minlength=nc) + 1.
         m = self.model[-1]  # Detect() module
         for mi, s in zip(m.m, m.stride):  # from
-            b = mi.bias.view(m.na, -1)  # conv.bias(255) to (3,85)
-            b.data[:, 4] += math.log(8 / (640 / s) ** 2)  # obj (8 objects per 640 image)
-            b.data[:, 5 : 5 + m.nc] += (
-                math.log(0.6 / (m.nc - 0.99999)) if cf is None else torch.log(cf / cf.sum())
-            )  # cls
+            b = mi.bias.view(m.na, -1)  # conv.bias per anchor: (na, 8 kpts + 1 obj + ncolor + ndigit)
+            b.data[:, 8] += math.log(8 / (640 / s) ** 2)  # obj (8 objects per 640 image)
+            b.data[:, 9 : 9 + m.ncolor] += math.log(0.6 / (m.ncolor - 0.99999))  # color branch
+            b.data[:, 9 + m.ncolor :] += math.log(0.6 / (m.ndigit - 0.99999))  # digit branch
             mi.bias = torch.nn.Parameter(b.view(-1), requires_grad=True)
 
 
@@ -396,7 +406,8 @@ def parse_model(d, ch):
     if not ch_mul:
         ch_mul = 8
     na = (len(anchors[0]) // 2) if isinstance(anchors, list) else anchors  # number of anchors
-    no = na * (nc + 9)  # number of outputs = anchors * (classes + 8 keypoints + 1 obj)
+    ncolor = d.get("ncolor", 2)  # dual-branch: number of colors
+    no = na * (8 + 1 + ncolor + nc // ncolor)  # outputs = anchors * (8 kpts + 1 obj + color + digit)
 
     layers, save, c2 = [], [], ch[-1]  # layers, savelist, ch out
     for i, (f, n, m, args) in enumerate(d["backbone"] + d["head"]):  # from, number, module, args
@@ -425,6 +436,8 @@ def parse_model(d, ch):
             nn.ConvTranspose2d,
             DWConvTranspose2d,
             C3x,
+            ShuffleV2Block,
+            MBV3Block,
         }:
             c1, c2 = ch[f], args[0]
             if c2 != no:  # if not output

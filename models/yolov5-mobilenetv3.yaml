@@ -1,0 +1,57 @@
+# YOLOv5 四点检测 + MobileNetV3-Small 轻量级 backbone
+# 面向 Jetson NX 等边缘设备部署
+# Usage: python train.py --cfg models/yolov5-mobilenetv3.yaml --weights '' --data data/data12.yaml
+# MBV3Block args: [c2, kernel, stride, c_expand, se, hardswish]
+
+nc: 12 # number of classes (2 colors x 6 stickers)
+ncolor: 2 # dual-branch head: number of colors
+depth_multiple: 1.0
+width_multiple: 1.0
+channel_multiple: 1 # 禁止 make_divisible 改变通道数
+
+anchors:
+  - [10, 13, 16, 30, 33, 23] # P3/8
+  - [30, 61, 62, 45, 59, 119] # P4/16
+  - [116, 90, 156, 198, 373, 326] # P5/32
+
+# MobileNetV3-Small backbone
+backbone:
+  # [from, number, module, args]
+  [
+    [-1, 1, Conv, [16, 3, 2]], # 0-P1/2
+    [-1, 1, MBV3Block, [16, 3, 2, 16, True, False]], # 1-P2/4
+    [-1, 1, MBV3Block, [24, 3, 2, 72, False, False]], # 2-P3/8
+    [-1, 1, MBV3Block, [24, 3, 1, 88, False, False]], # 3
+    [-1, 1, MBV3Block, [40, 5, 2, 96, True, True]], # 4-P4/16
+    [-1, 1, MBV3Block, [40, 5, 1, 240, True, True]], # 5
+    [-1, 1, MBV3Block, [40, 5, 1, 240, True, True]], # 6
+    [-1, 1, MBV3Block, [48, 5, 1, 120, True, True]], # 7
+    [-1, 1, MBV3Block, [48, 5, 1, 144, True, True]], # 8
+    [-1, 1, MBV3Block, [96, 5, 2, 288, True, True]], # 9-P5/32
+    [-1, 1, MBV3Block, [96, 5, 1, 576, True, True]], # 10
+    [-1, 1, MBV3Block, [96, 5, 1, 576, True, True]], # 11
+    [-1, 1, SPPF, [96, 5]], # 12
+  ]
+
+# 轻量化 PANet head
+head: [
+    [-1, 1, Conv, [64, 1, 1]], # 13
+    [-1, 1, nn.Upsample, [None, 2, "nearest"]], # 14
+    [[-1, 8], 1, Concat, [1]], # 15 cat P4
+    [-1, 1, C3, [64, False]], # 16
+
+    [-1, 1, Conv, [48, 1, 1]], # 17
+    [-1, 1, nn.Upsample, [None, 2, "nearest"]], # 18
+    [[-1, 3], 1, Concat, [1]], # 19 cat P3
+    [-1, 1, C3, [48, False]], # 20 (P3/8-small)
+
+    [-1, 1, Conv, [48, 3, 2]], # 21
+    [[-1, 17], 1, Concat, [1]], # 22 cat head P4
+    [-1, 1, C3, [64, False]], # 23 (P4/16-medium)
+
+    [-1, 1, Conv, [64, 3, 2]], # 24
+    [[-1, 13], 1, Concat, [1]], # 25 cat head P5
+    [-1, 1, C3, [96, False]], # 26 (P5/32-large)
+
+    [[20, 23, 26], 1, Detect, [nc, anchors]], # Detect(P3, P4, P5)
+  ]

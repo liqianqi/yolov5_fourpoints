@@ -1,0 +1,29 @@
+# Data12 dataset - 12 classes (2 colors x 6 stickers) with 4-keypoint annotations
+# 检测头为双分支: 颜色(B/R) + 贴纸(G,1,2,3,4,5)
+# 类别编号 = 颜色 * 6 + 贴纸 (O/Bs/Bb 及 N/P 颜色已删除)
+# Usage: python train.py --data data/data12.yaml
+
+# Paths
+path: ./data36          # dataset root dir
+train: train/images     # train images (relative to 'path')
+val: test/images        # val images (relative to 'path')
+
+# Dual-branch head
+ncolor: 2               # B(蓝), R(红)
+ndigit: 6               # G, 1, 2, 3, 4, 5
+
+# Classes
+nc: 12
+names:
+  0: B_G    # 蓝-哨兵
+  1: B_1    # 蓝-一号
+  2: B_2    # 蓝-二号
+  3: B_3    # 蓝-三号
+  4: B_4    # 蓝-四号
+  5: B_5    # 蓝-五号
+  6: R_G    # 红-哨兵
+  7: R_1    # 红-一号
+  8: R_2    # 红-二号
+  9: R_3    # 红-三号
+  10: R_4   # 红-四号
+  11: R_5   # 红-五号

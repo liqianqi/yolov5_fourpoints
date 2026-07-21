@@ -41,6 +41,25 @@ results*.csv
 coco/
 coco128/
 VOC/
+# 装甲板四点数据集（勿上传）
+data36/
+data36_bbox/
+
+# 本项目新增忽略 -------------------------------------------------------------------------------------------------------
+# TensorRT C++ 构建产物与可视化输出
+trt_cpp/build/
+trt_cpp/out_vis/
+trt_cpp/out*/
+trt_cpp/*.engine
+trt_cpp/compile_commands.json
+# TensorRT OSS 头文件（本地克隆，见 docs/USAGE.md）
+trt_cpp/third_party/
+
+# 训练日志与本地权重缓存
+train_*.log
+*.cache
+yolov5*.pt
+!models/**/*.yaml
 
 # MATLAB GitIgnore -----------------------------------------------------------------------------------------------------
 *.m~

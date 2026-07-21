@@ -14,6 +14,13 @@ from utils.general import LOGGER, TQDM_BAR_FORMAT, colorstr
 PREFIX = colorstr("AutoAnchor: ")
 
 
+def _kpts_wh(labels):
+    """从四点标签 (cls, x1..y4) 计算外接框归一化宽高 (n, 2)。"""
+    xs = labels[:, 1:9:2]
+    ys = labels[:, 2:9:2]
+    return np.stack([xs.max(1) - xs.min(1), ys.max(1) - ys.min(1)], 1)
+
+
 def check_anchor_order(m):
     """Checks and corrects anchor order against stride in YOLOv5 Detect() module if necessary."""
     a = m.anchors.prod(-1).mean(-1).view(-1)  # mean anchor area per output layer
@@ -30,7 +37,7 @@ def check_anchors(dataset, model, thr=4.0, imgsz=640):
     m = model.module.model[-1] if hasattr(model, "module") else model.model[-1]  # Detect()
     shapes = imgsz * dataset.shapes / dataset.shapes.max(1, keepdims=True)
     scale = np.random.uniform(0.9, 1.1, size=(shapes.shape[0], 1))  # augment scale
-    wh = torch.tensor(np.concatenate([l[:, 3:5] * s for s, l in zip(shapes * scale, dataset.labels)])).float()  # wh
+    wh = torch.tensor(np.concatenate([_kpts_wh(l) * s for s, l in zip(shapes * scale, dataset.labels)])).float()  # wh
 
     def metric(k):  # compute metric
         """Computes ratio metric, anchors above threshold, and best possible recall for YOLOv5 anchor evaluation."""
@@ -122,7 +129,7 @@ def kmean_anchors(dataset="./data/coco128.yaml", n=9, img_size=640, thr=4.0, gen
 
     # Get label wh
     shapes = img_size * dataset.shapes / dataset.shapes.max(1, keepdims=True)
-    wh0 = np.concatenate([l[:, 3:5] * s for s, l in zip(shapes, dataset.labels)])  # wh
+    wh0 = np.concatenate([_kpts_wh(l) * s for s, l in zip(shapes, dataset.labels)])  # wh
 
     # Filter
     i = (wh0 < 3.0).any(1).sum()

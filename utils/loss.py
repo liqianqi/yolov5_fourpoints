@@ -215,7 +215,9 @@ class ComputeLoss:
         self.ssi = list(m.stride).index(16) if autobalance else 0  # stride 16 index
         self.BCEcls, self.BCEobj, self.gr, self.hyp, self.autobalance = BCEcls, BCEobj, 1.0, h, autobalance
         self.na = m.na  # number of anchors
-        self.nc = m.nc  # number of classes
+        self.nc = m.nc  # number of classes (joint: ncolor * ndigit)
+        self.ncolor = m.ncolor  # dual-branch: number of colors
+        self.ndigit = m.ndigit  # dual-branch: number of digits/stickers
         self.nl = m.nl  # number of layers
         self.anchors = m.anchors
         self.device = device
@@ -233,26 +235,36 @@ class ComputeLoss:
             tobj = torch.zeros(pi.shape[:4], dtype=pi.dtype, device=self.device)  # target obj
 
             if n := b.shape[0]:
-                pkpts, _, pcls = pi[b, a, gj, gi].split((8, 1, self.nc), 1)  # keypoints, obj, cls
+                pkpts, _, pcolor, pdigit = pi[b, a, gj, gi].split((8, 1, self.ncolor, self.ndigit), 1)  # kpts, obj, color, digit
 
-                # Regression (keypoints)
-                pkpts = pkpts.sigmoid() * 2 - 0.5  # decode keypoints relative to grid cell
-                
+                # Regression (keypoints) - anchor 尺度归一空间
+                # 预测为线性原始输出(无 sigmoid, 无界), 目标为 (kpt_grid - gij) / anchor_wh,
+                # 解决 sigmoid*2-0.5 只能表示 ±1 cell 导致角点回归饱和的问题
+                anch4 = anchors[i].repeat(1, 4)  # (n, 8): w,h 对应 x,y 交替排列
+                tkpts = tbox[i] / anch4  # 目标偏移归一到 anchor 尺度
+
                 # Keypoint regression loss: 多损失组合提升精度
-                # Wing Loss对小误差敏感，L2惩罚大偏差，GIoU优化整体形状
-                loss_wing = wing_loss(pkpts, tbox[i], w=0.1, epsilon=0.01)  # 小误差敏感
-                loss_l2 = nn.functional.mse_loss(pkpts, tbox[i])  # 大偏差惩罚
-                loss_giou = polygon_giou_loss(pkpts, tbox[i])  # 整体形状对齐
+                # Wing Loss对小误差敏感，L2惩罚大偏差，GIoU优化整体形状(IoU对轴向缩放不变)
+                loss_wing = wing_loss(pkpts, tkpts, w=0.1, epsilon=0.01)  # 小误差敏感
+                loss_l2 = nn.functional.mse_loss(pkpts, tkpts)  # 大偏差惩罚
+                loss_giou = polygon_giou_loss(pkpts, tkpts)  # 整体形状对齐
                 lbox += 0.5 * loss_wing + 0.2 * loss_l2 + 0.3 * loss_giou
 
                 # Objectness
                 tobj[b, a, gj, gi] = 1.0  # positive samples get obj target = 1.0
 
-                # Classification
-                if self.nc > 1:  # cls loss (only if multiple classes)
-                    t = torch.full_like(pcls, self.cn, device=self.device)  # targets
-                    t[range(n), tcls[i]] = self.cp
-                    lcls += self.BCEcls(pcls, t)  # BCE
+                # Classification (双分支: 颜色 + 数字)
+                # 联合类别 id = color * ndigit + digit
+                tcolor = torch.div(tcls[i], self.ndigit, rounding_mode="floor")
+                tdigit = tcls[i] % self.ndigit
+                if self.ncolor > 1:
+                    t_color = torch.full_like(pcolor, self.cn, device=self.device)
+                    t_color[range(n), tcolor] = self.cp
+                    lcls += self.BCEcls(pcolor, t_color)
+                if self.ndigit > 1:
+                    t_digit = torch.full_like(pdigit, self.cn, device=self.device)
+                    t_digit[range(n), tdigit] = self.cp
+                    lcls += self.BCEcls(pdigit, t_digit)
 
             obji = self.BCEobj(pi[..., 8], tobj)  # objectness is at index 8 now
             lobj += obji * self.balance[i]  # obj loss
