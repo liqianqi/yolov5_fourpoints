@@ -1,14 +1,15 @@
 // YOLOv5 四点装甲板检测 - TensorRT C++ 推理测试程序
 //
 // 功能:
-//   1. 首次运行时从 FP16 ONNX 构建 engine 并缓存
-//      (TensorRT 11 为强类型网络, 精度跟随 ONNX 数据类型, 故导出时用 --half)
-//   2. 对目录内所有图片推理: letterbox 预处理 -> enqueueV3 -> 置信度过滤 + NMS
-//   3. 绘制四边形与类别标签保存到输出目录, 统计延迟
+//   1. 首次运行时从 ONNX 构建 engine 并缓存
+//      (TensorRT 11 为强类型网络, 精度跟随 ONNX 数据类型: 导出加 --half 为 FP16, 不加为 FP32)
+//   2. 自动识别 engine I/O 精度, FP16/FP32 都能跑 (FP16 时 host 侧 float 转 __half 上传)
+//   3. 对目录内所有图片推理: letterbox 预处理 -> enqueueV3 -> 置信度过滤 + NMS
+//   4. 绘制四边形与类别标签保存到输出目录, 统计延迟
 //
 // 模型输出: (1, 25200, 21) = 8 关键点像素坐标(640尺度) + 1 obj + 12 联合类别分数
 //
-// 用法: ./trt_detect <onnx_fp16> <engine> <images_dir> <out_dir> [conf=0.4] [iou=0.3]
+// 用法: ./trt_detect <onnx> <engine> <images_dir> <out_dir> [conf=0.4] [iou=0.3]
 
 #include <NvInfer.h>
 #include <NvOnnxParser.h>
@@ -232,16 +233,28 @@ int main(int argc, char** argv) {
     auto engine = runtime->deserializeCudaEngine(engineData.data(), engineData.size());
     auto context = engine->createExecutionContext();
 
+    // 自动识别 I/O 精度 (FP16 or FP32). 强类型网络下两者都是 DataType::kHALF / kFLOAT.
+    auto inType = engine->getTensorDataType("images");
+    auto outType = engine->getTensorDataType("output0");
+    if (inType != outType) {
+        std::cerr << "输入输出精度不一致 (in=" << static_cast<int>(inType)
+                  << ", out=" << static_cast<int>(outType) << "), 不支持" << std::endl;
+        return 1;
+    }
+    const bool isFp16 = (inType == nvinfer1::DataType::kHALF);
+    const size_t elemSize = isFp16 ? sizeof(__half) : sizeof(float);
+    std::cout << "Engine 精度: " << (isFp16 ? "FP16" : "FP32") << std::endl;
+
     const size_t inSize = 3 * INPUT_H * INPUT_W, outSize = size_t(NUM_PRED) * NUM_COLS;
     void *dIn, *dOut;
-    CUDA_CHECK(cudaMalloc(&dIn, inSize * sizeof(__half)));
-    CUDA_CHECK(cudaMalloc(&dOut, outSize * sizeof(__half)));
+    CUDA_CHECK(cudaMalloc(&dIn, inSize * elemSize));
+    CUDA_CHECK(cudaMalloc(&dOut, outSize * elemSize));
     context->setTensorAddress("images", dIn);
     context->setTensorAddress("output0", dOut);
     cudaStream_t stream;
     CUDA_CHECK(cudaStreamCreate(&stream));
 
-    // FP16 模型: host 侧 float 预处理后转 __half 上传, 输出 __half 转回 float
+    // host 侧缓冲区: float 为通用计算格式, halfH 仅 FP16 时用于上传/下载
     std::vector<float> blob(inSize), output(outSize);
     std::vector<__half> blobH(inSize), outputH(outSize);
 
@@ -273,16 +286,27 @@ int main(int argc, char** argv) {
         float gain, padW, padH;
         cv::Mat lb = letterbox(img, gain, padW, padH);
         blobFromImage(lb, blob.data());
-        for (size_t k = 0; k < inSize; ++k) blobH[k] = __float2half(blob[k]);
-        CUDA_CHECK(cudaMemcpyAsync(dIn, blobH.data(), inSize * sizeof(__half),
+        const void* uploadPtr = blob.data();
+        if (isFp16) {
+            for (size_t k = 0; k < inSize; ++k) blobH[k] = __float2half(blob[k]);
+            uploadPtr = blobH.data();
+        }
+        CUDA_CHECK(cudaMemcpyAsync(dIn, uploadPtr, inSize * elemSize,
                                    cudaMemcpyHostToDevice, stream));
         auto t1 = Clock::now();
 
         context->enqueueV3(stream);
-        CUDA_CHECK(cudaMemcpyAsync(outputH.data(), dOut, outSize * sizeof(__half),
-                                   cudaMemcpyDeviceToHost, stream));
-        cudaStreamSynchronize(stream);
-        for (size_t k = 0; k < outSize; ++k) output[k] = __half2float(outputH[k]);
+        const void* downloadPtr = nullptr;
+        if (isFp16) {
+            CUDA_CHECK(cudaMemcpyAsync(outputH.data(), dOut, outSize * sizeof(__half),
+                                       cudaMemcpyDeviceToHost, stream));
+            cudaStreamSynchronize(stream);
+            for (size_t k = 0; k < outSize; ++k) output[k] = __half2float(outputH[k]);
+        } else {
+            CUDA_CHECK(cudaMemcpyAsync(output.data(), dOut, outSize * sizeof(float),
+                                       cudaMemcpyDeviceToHost, stream));
+            cudaStreamSynchronize(stream);
+        }
         auto t2 = Clock::now();
 
         auto dets = postprocess(output.data(), confThres, iouThres, gain, padW, padH,
